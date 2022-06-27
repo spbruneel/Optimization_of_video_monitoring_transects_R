@@ -1,0 +1,2803 @@
+---
+title: "Optimization of video monitoring for reef fish assessments"
+author: "Stijn bruneel"
+date: "20 November 2019"
+output:
+  pdf_document: default
+  word_document: default
+fig_caption: yes
+---
+
+```{r global_options, include=FALSE}
+# knitr::opts_chunk$set(warning=FALSE, message=FALSE)
+```
+
+```{r warning=FALSE, message=FALSE, include=FALSE}
+#Different useful library, not all of them are being used here
+library(readxl)
+library(rlang)
+library(wrapr)
+library(dplyr)
+library(ggplot2)
+library(nlme)
+library(lme4)
+library(arm)
+library(mgcv)
+library(lmerTest)
+library(MuMIn)
+library(DAAG)
+library(vegan)
+library(tibble)
+library(pvclust)
+library(cluster)
+library(vegan)
+library(reshape2)
+library(diverse)
+library(labdsv)
+library(DataCombine)
+library(reshape2)
+library(tibble)
+library(plotly)
+library(slam)
+library(qlcMatrix)
+library(popbio)
+library(indicspecies)
+library(iterators)
+library(parallel)
+library(foreach)
+library(doParallel)
+library(knitr)
+library(gridExtra)
+library(readxl)
+library(ggpubr)
+library(ggplot2)
+library(scales) # for "comma"
+library(magrittr)
+library(sp)
+library(leaflet)
+library(glmmADMB)
+library(glmmTMB)
+library(sjstats)
+library(flextable)
+library(kableExtra)
+library(data.table)
+library(DHARMa)
+```
+
+```{r}
+if (file.exists("./combinations/")==FALSE){dir.create("./combinations/")}
+if (file.exists("./Rdata/")==FALSE){dir.create("./Rdata/")}
+```
+
+```{r echo=FALSE}
+#Read and process the list with observed species. This file will be used later to select the 'species' columns from the data 
+specieslist=read_excel("./specieslist_fake.xlsx")
+specieslist=as.data.frame(specieslist[,2])
+colnames(specieslist)="Species"
+specieslist<-t(specieslist)
+colnames(specieslist)<-specieslist
+```
+
+```{r echo=FALSE}
+# Preprocess the data of your choice
+preprocess_data<-function(file_name){
+  data <- read_excel(file_name)
+  data$Code<-paste(data$Location,data$Transect,data$Person)
+  data$loctranspers<-paste(data$Location,data$Transect,data$Repeat)
+  data$Code_direction<-paste(data$Code,data$direction,sep="_")
+  data$Island<-substr(data$Location,1,1)
+  data$Island[which(data$Island=="B")]<-"SantaCruz"
+  data$Island[which(data$Island=="C")]<-"Floreana"
+  data$Code_Transect<-paste(data$Location,data$Transect,sep="_")
+  data$Location_Transect_direction<-paste(data$Code_Transect,data$direction,sep="_")
+  return(data)
+}
+```
+
+```{r echo=FALSE}
+#In data sets of different transect lengths, different species might be present. For example a species seen during 50 meter transects might not have been seen in the 10 meter transects. Tis species is then added to the 10 meter data frame as an empty column.
+add_all_species<-function(data,specieslist){
+  columns_to_insert=colnames(specieslist)[which(!(colnames(specieslist) %in% colnames(data)))]
+  data[columns_to_insert]=0
+  return(data)
+}
+```
+
+```{r}
+#Insert empty rows in case omitted. This makes sure that all data sets of different transect lengths have the same number of rows.
+Insert.empty.rows<-function(data.repeat.100,data.repeat.300){
+  if (abs(nrow(data.repeat.300)-nrow(data.repeat.100))>0){
+    store=NA
+    right.order<-colnames(data.repeat.300)
+    data.repeat.100<-data.repeat.100[right.order]
+    for (k in 1:(nrow(data.repeat.300)-nrow(data.repeat.100))){
+      temp.vector<-which(data.repeat.100$Repeat!=data.repeat.300$Repeat)
+      store[k]=temp.vector[1]
+      data.repeat.100=InsertRow(data.repeat.100,data.repeat.300[temp.vector[1],],temp.vector[1]) 
+      data.repeat.100[temp.vector[1],c(which(colnames(data.repeat.100) %in% colnames(specieslist)))]<-0
+    }
+    store.not.1<-store[which(data.repeat.100[store,"Repeat"]!=1)]
+    store.1<-store[which(data.repeat.100[store,"Repeat"]==1)]
+    
+    data.repeat.100[store.not.1,]=data.repeat.100[store.not.1-1,]
+    for (i in 1:length(store.not.1)){
+      data.repeat.100[store.not.1[i],"Repeat"]=as.character(as.numeric(data.repeat.100[store.not.1[i],"Repeat"])+1)
+    }
+    
+    if (length(store.1)>0){
+      data.repeat.100[store.1,]=data.repeat.100[store.1+1,]
+      for (i in 1:length(store.1)){
+        data.repeat.100[store.1[i],"Repeat"]=as.character(as.numeric(data.repeat.100[store.1[i],"Repeat"])-1)
+      }
+    }
+    
+    data.repeat.100[store,"direction"]=data.repeat.100[store,"direction"]*(-1)
+    data.repeat.100[store,c(which(colnames(data.repeat.100) %in% colnames(specieslist)))]=0
+  }
+  return(data.repeat.100)
+}
+```
+
+```{r}
+#Determine cumulative amount of species
+Cum.species<-function(data,grouping){
+  data$CumulativeamountofspeciesRepeat<-NA
+    #Determine cumulative amount of species of repeats
+    splitted_data<-split(data,f=lapply(data[,grouping],as.character)[[1]])
+    for (i in 1:length(unique(lapply(data[,grouping],as.character)[[1]]))){
+      x=splitted_data[[i]][,c(which(colnames(splitted_data[[i]]) %in% colnames(specieslist)))]
+      for (j in 1:nrow(x)){
+        y=x[c(1:j),]
+        z=apply(y,2,function(z) {any(is.na(z)==FALSE)})
+        cum=length(which(z==TRUE))
+        newname1=paste('CumulativeamountofspeciesRepeat',grouping,sep="_")
+        splitted_data[[i]][j,c(newname1)]=cum
+        splitted_data[[i]]['CodeTransectRepeat']=1:nrow(splitted_data[[i]])
+      }
+      for (j in 1:nrow(x)){
+        newname2=paste('CumulativeamountofspeciesRepeat',grouping,"standard",sep="_")
+  splitted_data[[i]][j,c(newname2)]=splitted_data[[i]][j,c(newname1)]/splitted_data[[i]][nrow(splitted_data[[i]]),c(newname1)]
+      }
+    }
+  data.repeat<- do.call("rbind", splitted_data)
+  return(data.repeat)
+}
+```
+
+```{r}
+#The data set with the longest transect length will have the maximum number of rows and is therefore used as baseline to standaridze the other data sets.
+RUN.baseline<-function(file_name){
+  data<-preprocess_data(file_name)
+  data<-add_all_species(data,specieslist)
+}
+#This is run for all data sets but the baseline, when the baseline is established.
+RUN<-function(file_name,baseline){
+  data<-preprocess_data(file_name)
+  data<-add_all_species(data,specieslist)
+  data<-Insert.empty.rows(data,baseline)
+}
+```
+
+```{r}
+#Preprocess the data, add all species and insert empty rows if needed
+data.repeat.50<-RUN.baseline("./Data/Fake_data/N50.xlsx")
+data.repeat.40<-RUN("./Data/Fake_data/N40.xlsx",data.repeat.50)
+data.repeat.30<-RUN("./Data/Fake_data/N30.xlsx",data.repeat.50)
+data.repeat.20<-RUN("./Data/Fake_data/N20.xlsx",data.repeat.50)
+data.repeat.10<-RUN("./Data/Fake_data/N10.xlsx",data.repeat.50)
+```
+
+```{r}
+#Cumulative species richness is determined for every observation using different grouping factors 
+data.repeat.10<-Cum.species(data.repeat.10,"Code")
+data.repeat.10<-Cum.species(data.repeat.10,"Code_Transect")
+data.repeat.20<-Cum.species(data.repeat.20,"Code")
+data.repeat.20<-Cum.species(data.repeat.20,"Code_Transect")
+data.repeat.30<-Cum.species(data.repeat.30,"Code")
+data.repeat.30<-Cum.species(data.repeat.30,"Code_Transect")
+data.repeat.40<-Cum.species(data.repeat.40,"Code")
+data.repeat.40<-Cum.species(data.repeat.40,"Code_Transect")
+data.repeat.50<-Cum.species(data.repeat.50,"Code")
+data.repeat.50<-Cum.species(data.repeat.50,"Code_Transect")
+```
+
+```{r echo=FALSE}
+# Shannon index function based on vector data
+SW<-function(row,data.repeat){
+  row<-row[c(which(colnames(data.repeat) %in% colnames(specieslist)))]
+  row<-row[which(is.na(row)==FALSE & row!=0)]
+  numberofspecies=length(row)
+  if (numberofspecies==0){
+    H=0
+  }
+  if (numberofspecies!=0){
+    som=sum(row)
+    row<-row/som
+    H<-(-1)*sum(row*log(row))
+  }
+  return(H)
+}
+# Run the Shannon index function and combine the outcome in the dataframe as an extra column
+RUN.SW<-function(data.repeat){
+  data.repeat$H<-NA
+  for (i in 1:nrow(data.repeat)){
+    H<-SW(data.repeat[i,],data.repeat)
+    data.repeat$H[i]<-H
+  }
+  return(data.repeat)
+}
+data.repeat.10<-RUN.SW(data.repeat.10)
+data.repeat.20<-RUN.SW(data.repeat.20)
+data.repeat.30<-RUN.SW(data.repeat.30)
+data.repeat.40<-RUN.SW(data.repeat.40)
+data.repeat.50<-RUN.SW(data.repeat.50)
+data.repeat<-data.repeat.50
+```
+
+```{r echo=FALSE}
+#Transform the biological data of the data frame
+Transformation_data<-function(x,type){
+  #Select only the biological data
+  x=x[,c(which(colnames(x) %in% colnames(specieslist)))]
+  #Set all missing data to 0 (=absence)
+  x[is.na(x)==TRUE]=0
+  #Define the type of transformation
+  if (type=="4root"){
+    x<-sqrt(sqrt(x))
+  }
+  if (type=="no transformation"){
+    x<-x
+  }
+  if (type=="log"){
+    x<-log(x+1)
+  }
+  if (type=="log10"){
+    x<-log10(x+1)
+  }
+  if (type=="presence-absence"){
+     x[x>0] <-1
+  }
+  return(x)
+}
+```
+
+```{r}
+#Plot the cumulative number of species
+g<-ggplot(data.repeat,aes(x=CodeTransectRepeat,y=CumulativeamountofspeciesRepeat_Code_Transect,group=Code_Transect))
+  g <- g + geom_line(aes(colour=Location),alpha=0.3,lwd=2)
+  g <- g + coord_cartesian(ylim = c(0, 30))
+  g <- g + geom_point(pch=21,size=2) + ylab("Cumulative species richness")
+g
+```
+
+```{r}
+#Plot the normalized cumulative number of species
+g<-ggplot(data.repeat,aes(x=CodeTransectRepeat,y=CumulativeamountofspeciesRepeat_Code_Transect_standard,group=Code_Transect))
+  g <- g + geom_line(aes(colour=Location),alpha=0.3,lwd=2)
+  g <- g + coord_cartesian(ylim = c(0, 1))
+  g <- g + geom_point(pch=21,size=2) + ylab("Cumulative species richness")
+g
+```
+
+```{r echo=FALSE}
+data.repeat.temp<-data.repeat %>%
+  dplyr::group_by(Repeat) %>%
+  dplyr::summarize(mean_H=mean(H,na.rm=TRUE),
+                   mean_richness=mean(CumulativeamountofspeciesRepeat_Code,na.rm=TRUE),
+                   sd_richness=sd(CumulativeamountofspeciesRepeat_Code,na.rm = TRUE),
+                   sd_H=sd(H,na.rm = TRUE)
+                   )
+n=540/6
+data.repeat.temp$low_conf_mean<-data.repeat.temp$mean_richness-qt(0.975,df=n-1)*data.repeat.temp$sd_richness/sqrt(n)
+data.repeat.temp$high_conf_mean<-data.repeat.temp$mean_richness+qt(0.975,df=n-1)*data.repeat.temp$sd_richness/sqrt(n)
+#Plot the average cumulative number of species with confidence interval
+g<-ggplot(data=data.repeat.temp,aes(x=Repeat,y=mean_richness,group=1))
+g<-g+geom_line()+geom_point()
+g<-g+geom_ribbon(data=data.repeat.temp,aes(x=Repeat,ymin=low_conf_mean,ymax=high_conf_mean),alpha=0.2)
+g
+```
+
+```{r echo=FALSE}
+data.repeat.temp<-data.repeat %>%
+  dplyr::group_by(CodeTransectRepeat) %>%
+  dplyr::summarize(mean_H=mean(H,na.rm=TRUE),
+                   mean_richness=mean(CumulativeamountofspeciesRepeat_Code_Transect,na.rm=TRUE),
+                   sd_richness=sd(CumulativeamountofspeciesRepeat_Code_Transect,na.rm = TRUE),
+                   sd_H=sd(H,na.rm = TRUE)
+                   )
+n=540/18
+data.repeat.temp$low_conf_mean<-data.repeat.temp$mean_richness-qt(0.975,df=n-1)*data.repeat.temp$sd_richness/sqrt(n)
+data.repeat.temp$high_conf_mean<-data.repeat.temp$mean_richness+qt(0.975,df=n-1)*data.repeat.temp$sd_richness/sqrt(n)
+g<-ggplot(data=data.repeat.temp,aes(x=CodeTransectRepeat,y=mean_richness,group=1))
+g<-g+geom_line()+geom_point()
+g<-g+geom_ribbon(data=data.repeat.temp,aes(x=CodeTransectRepeat,ymin=low_conf_mean,ymax=high_conf_mean),alpha=0.2)
+g
+```
+
+```{r echo=FALSE}
+data.repeat.temp<-data.repeat %>%
+  dplyr::group_by(CodeTransectRepeat) %>%
+  dplyr::summarize(mean_H=mean(H,na.rm=TRUE),
+                   mean_richness=mean(CumulativeamountofspeciesRepeat_Code_Transect_standard,na.rm=TRUE),
+                   sd_richness=sd(CumulativeamountofspeciesRepeat_Code_Transect_standard,na.rm = TRUE),
+                   sd_H=sd(H,na.rm = TRUE)
+                   )
+n=540/18
+data.repeat.temp$low_conf_mean<-data.repeat.temp$mean_richness-qt(0.975,df=n-1)*data.repeat.temp$sd_richness/sqrt(n)
+data.repeat.temp$high_conf_mean<-data.repeat.temp$mean_richness+qt(0.975,df=n-1)*data.repeat.temp$sd_richness/sqrt(n)
+#Plot the normalized average cumulative number of species with confidence interval
+g<-ggplot(data=data.repeat.temp,aes(x=CodeTransectRepeat,y=mean_richness,group=1))
+g<-g+geom_line()+geom_point()
+g<-g+geom_ribbon(data=data.repeat.temp,aes(x=CodeTransectRepeat,ymin=low_conf_mean,ymax=high_conf_mean),alpha=0.2)
+g
+```
+
+```{r}
+#Permutation-based SAC (Species Accumulation Curve)
+SCA_Personal<-function(data.repeat,group,run){
+  if (run=="YES"){
+    runloop<-unique(data.repeat[,group])
+    dim1=nrow(data.repeat)
+    dim3=3
+    numberofrepeats=dim1/nrow(runloop)
+    SCA <- expand.grid(repeats=c(1:numberofrepeats),group=lapply(runloop,as.character)[[1]],stringsAsFactors = FALSE)
+    SCA[,c("mean.S","upper.S","lower.S")]=NA
+    for (i in 1:nrow(runloop)){
+      BC=data.repeat[which(data.repeat[,group]==as.character(runloop[i,1])),]
+      BC.fish<-Transformation_data(BC,"no transformation")
+      S = apply( (BC.fish > 0), MARGIN = 1, FUN = sum)
+      N = dim(BC.fish)[1]
+      index = 1:N
+      nperm = 10
+      S.subset = matrix(rep(0,nperm*N),nrow = nperm, ncol = N)
+      S.subset[1:nperm,N] = sum(apply( (BC.fish > 0), MARGIN = 2, FUN = sum) != 0 ) 
+      for (iperm in 1:nperm) {
+        for (isamp in 1:(N-1)) {             # for each sample size
+          indexperm = sample(index, size = isamp, replace = F )   # get a random subset without replacement
+          subset = BC.fish[indexperm,]
+          S.subset[iperm,isamp] = sum(apply( (subset > 0), MARGIN = 2, FUN = sum) != 0 )
+        }
+      }
+      quant.upper = function(x) quantile(x, prob = 0.975, na.rm = TRUE, digits=6)
+      quant.lower = function(x) quantile(x, prob = 0.025, na.rm = TRUE, digits=6)
+      var=colMeans(S.subset)
+      SCA$mean.S[which(SCA$group==as.character(runloop[i,1]))] = var
+      SCA$upper.S[which(SCA$group==as.character(runloop[i,1]))] = var+apply(S.subset,MARGIN = 2,sd)*qt(0.975,df=length(var)-1)
+      SCA$lower.S[which(SCA$group==as.character(runloop[i,1]))] = var-apply(S.subset,MARGIN = 2,sd)*qt(0.975,df=length(var)-1)
+    }
+    return(SCA)
+  }
+}
+```
+
+```{r}
+#Plot the SCA
+SCA.plot<-function(SCA,xlim,ylim,annote){
+  h<-ggplot(data = SCA,aes(x=repeats,y=mean.S,group=group))
+  h<-h+xlim(0,xlim)+ylim(0,ylim)+ylab("Species richness")+xlab("Cumulative number of repeats")
+  h<-h+geom_point(aes(color=group))+geom_line(aes(color=group))
+  h<-h+geom_errorbar(data=SCA,aes(x=repeats,ymin=lower.S,ymax=upper.S),alpha=0.2)
+  h<-h+theme(legend.position="none",
+                           #panel.grid.major = element_blank(),
+                           axis.line = element_line(colour = "black"),
+                           text=element_text(size=16,  family="serif"),
+                           panel.background = element_rect(fill = "white", colour = NA),
+                           panel.grid.major = element_line(colour = "gray"),
+                           panel.grid.minor = element_blank(),
+                           axis.title = element_text(size = rel(1), colour = "black"),
+                           axis.text = element_text(size = rel(1), colour = "black"),
+                           line = element_line(colour = "black", size = 0.5, linetype = 1, lineend = "butt"))
+  h<-h+annotate("text", x=xlim, y=ylim, label= annote ,size=8,family="serif")
+  print(h)
+  return(h)
+}
+#Plot the SCA
+SCA.plot.different.colors.for.the.islands<-function(SCA,xlim,ylim,annote){
+  h<-ggplot(data = SCA,aes(x=repeats,y=mean.S,group=group))
+  h<-h+xlim(0,xlim)+ylim(0,ylim)+ylab("Species richness")+xlab("Cumulative number of repeats")
+  h<-h+geom_point(aes(color=group))#+geom_line(aes(color=group))
+  h<-h+geom_errorbar(data=SCA,aes(x=repeats,ymin=lower.S,ymax=upper.S),alpha=0.2)
+  h<-h+theme(legend.text=element_text(size=12),
+                           legend.justification=c(0.5,0.5),legend.key.size =  unit(0.3, "in"),
+                           legend.position=c(0.90, 0.42),legend.title = element_blank(),
+                           #panel.grid.major = element_blank(),
+                           axis.line = element_line(colour = "black"),
+                           text=element_text(size=16,  family="serif"),
+                           panel.background = element_rect(fill = "white", colour = NA),
+                           panel.grid.major = element_line(colour = "gray"),
+                           panel.grid.minor = element_blank(),
+                           axis.title = element_text(size = rel(1), colour = "black"),
+                           axis.text = element_text(size = rel(1), colour = "black"),
+                           line = element_line(colour = "black", size = 0.5, linetype = 1, lineend = "butt"))
+  h<-h+annotate("text", x=xlim, y=ylim, label= annote ,size=8,family="serif")
+  print(h)
+  return(h)
+}
+```
+
+```{r}
+#Determine and plot SCA
+SCA_Transect<-SCA_Personal(data.repeat,"Code_Transect",run="YES")
+h1<-SCA.plot(SCA_Transect,20,30,"(A)")
+SCA_Location<-SCA_Personal(data.repeat,"Location",run="YES")
+h2<-SCA.plot(SCA_Location,60,30,"(B)")
+```
+
+```{r}
+#Turn strings into factors for model development
+data.repeat.50$fIsland<-as.factor(data.repeat.50$Island)
+data.repeat.50$fLocation<-as.factor(data.repeat.50$Location)
+data.repeat.50$fCode_Transect<-as.factor(data.repeat.50$Code_Transect)
+data.repeat.50$fPerson<-as.factor(data.repeat.50$Person)
+data.repeat.50[is.na(data.repeat.50)==TRUE]=0
+```
+
+
+```{r echo=FALSE, warning=FALSE}
+# Mixed model -------------------------------------------------------------
+library(lme4)
+library(lsmeans)
+
+#Island: fixed, Location and Transect: nested random factors, Observer: crossed random factor
+form.S<-as.formula(totalamountofspecies ~ Island           
+                 + (1|Location/Code_Transect)
+                 + (1|Person)
+                 + (1|Person:Location) 
+                 + (1|Person:Code_Transect)
+                 )
+
+
+M1.50.S<-lmer(form.S,data.repeat.50)
+summary(M1.50.S)
+icc(M1.50.S)
+
+form.H<-as.formula(H ~ Island           
+                 + (1|Location/Code_Transect)
+                 + (1|Person)
+                 + (1|Person:Location) 
+                 + (1|Person:Code_Transect)
+                 )
+
+M1.50.H <- lmer(form.H, data.repeat.50)
+```
+
+
+```{r}
+data.repeat.50$fLocation<-as.factor(data.repeat.50$Location)
+for (i in specieslist){
+  print(ggplot(aes_string(x = "fLocation", y = i),data=data.repeat.50)+geom_boxplot())
+}
+```
+
+```{r}
+#Create uniform plots
+clean_theme<-theme(legend.title=element_text(size=5), legend.text=element_text(size=5),
+                           legend.justification=c(0.5,0.5),legend.key.size =  unit(0.1, "in"),
+                           #legend.position=c(0.80, 0.7),
+                           #panel.grid.major = element_blank(),
+                           axis.line = element_line(colour = "black"),
+                           text=element_text(size=16,  family="serif"),
+                           panel.background = element_rect(fill = "white", colour = NA),
+                           panel.grid.major = element_line(colour = "gray"),
+                           panel.grid.minor = element_blank(),
+                           axis.title = element_text(size = rel(1), colour = "black"),
+                           axis.text = element_text(size = rel(1), colour = "black"),
+                           line = element_line(colour = "black", size = 0.5, linetype = 1, lineend = "butt"))
+```
+
+
+```{r}
+#Determine order of observations to check for temporal autocorrelation
+autocorrelation_check_data=read_excel("./autocorrelation_check.xlsx")
+data_full_autocorr=data.repeat.50
+```
+
+```{r}
+#Check how many unique values are to be found per column of a dataframe
+totaluniquevals <- function(df) {
+  x <<- data.frame("Row Name"= numeric(0), "TotalUnique"=numeric(0), "IsNA"=numeric(0))
+  result <- sapply(df, function(x) length(unique(x)))
+  isnatotals <- sapply(df, function(x) sum(is.na(x)))
+
+  #Now Create the Row names
+  for (i in 1:length(colnames(df))) {
+    x[i,1] <<- (names(result[i]))
+    x[i,2] <<- result[[i]]
+    x[i,3] <<- isnatotals[[i]]
+
+  }
+  return(x)
+}
+```
+
+```{r}
+#Binomial model for series of 18 repeats
+data_full_autocorr_merged_bin=merge(data_full_autocorr,autocorrelation_check_data,by=c("Location","Transect","Person","Repeat"))
+data_full_autocorr_merged_bin_biol=Transformation_data(data_full_autocorr_merged_bin,type="presence-absence")
+data_full_autocorr_merged_bin_biol$Location=data_full_autocorr_merged_bin$Location
+data_full_autocorr_merged_bin_biol$Transect=data_full_autocorr_merged_bin$Transect
+data_full_autocorr_merged_bin_biol$Order=data_full_autocorr_merged_bin$Order
+data_full_autocorr_merged_bin_biol$Code_Transect=paste(data_full_autocorr_merged_bin_biol$Location,data_full_autocorr_merged_bin_biol$Transect)
+data_full_autocorr_merged_bin_biol$Person<-data_full_autocorr_merged_bin$Person
+data_full_autocorr_merged_bin_biol$fOrder=as.factor(data_full_autocorr_merged_bin_biol$Order)
+data_full_autocorr_merged_bin_biol$Island<-data_full_autocorr_merged_bin$Island
+data_full_autocorr_merged_bin_biol<-data_full_autocorr_merged_bin_biol[order(data_full_autocorr_merged_bin_biol$Location,data_full_autocorr_merged_bin_biol$Transect,data_full_autocorr_merged_bin_biol$Order),]
+
+a=Transformation_data(data_full_autocorr_merged_bin_biol,type="no transformation")
+y=totaluniquevals(a)
+
+specieslist.SC<-specieslist[which(specieslist %in% y$Row.Name[which(y$TotalUnique==2)])]
+specieslist.SC<-specieslist
+
+stringToQuoser <- function(varName) {
+  wrapr::let(c(VARNAME = varName), quo(VARNAME))
+}
+
+for (j in 1:length(specieslist.SC)){
+  response <- stringToQuoser(specieslist.SC[j])
+  data_full_autocorr_merged_bin_biol_detected<-data_full_autocorr_merged_bin_biol %>%
+    dplyr::group_by(Code_Transect) %>%
+    dplyr::summarize(presence=sum((!!response)))
+  data_full_autocorr_merged_bin_biol_for_model=data_full_autocorr_merged_bin_biol[which(data_full_autocorr_merged_bin_biol$Code_Transect %in% data_full_autocorr_merged_bin_biol_detected$Code_Transect[which(data_full_autocorr_merged_bin_biol_detected$presence!=0)]),]
+  if (length(which(data_full_autocorr_merged_bin_biol_detected$presence!=0))>1){
+    mbin=glmer(as.formula(paste(specieslist.SC[j],"~1+Order+(1|Code_Transect)")), data = data_full_autocorr_merged_bin_biol_for_model, family = binomial)} else {mbin=glm(as.formula(paste(specieslist.SC[j],"~1+Order")), data = data_full_autocorr_merged_bin_biol_for_model, family = binomial)}
+  print(summary(mbin))
+  r=as.data.frame(summary(mbin)$coefficients)
+  rownames(r)[1]=specieslist.SC[j]
+  if (j==1){
+    p=r
+  } else {p=rbind(p,r)}
+  data_full_autocorr_merged_bin_biol_for_graph<-data_full_autocorr_merged_bin_biol_for_model[,c(specieslist.SC[j],"Order","Code_Transect")]
+  data_full_autocorr_merged_bin_biol_for_graph[,specieslist.SC[j]]=as.factor(data_full_autocorr_merged_bin_biol_for_graph[,specieslist.SC[j]])
+  data_full_autocorr_merged_bin_biol_for_graph[,"Code_Transect"]=as.factor(data_full_autocorr_merged_bin_biol_for_graph[,"Code_Transect"])
+  g1<-ggplot(data=data_full_autocorr_merged_bin_biol_for_graph,aes_string(x="Order",y=specieslist.SC[j]))+clean_theme()+geom_point(position=position_jitter(w = 0, h = 0.2),aes_string(color="Code_Transect",shape=specieslist.SC[j]))+theme(legend.position = "none")+clean_theme+ggtitle(specieslist.SC[j])
+  #Plot presence and absence in function of ordered repeat with different colors for different transects
+ print(g1)
+}
+p[,c("Estimate","Std. Error","z value")]=round(p[,c("Estimate","Std. Error","z value")],digits = 2)
+p[,c("Pr(>|z|)")]=round(p[,c("Pr(>|z|)")],digits = 6)
+```
+
+```{r}
+#Binomial model for series of 6 repeats
+data_full_autocorr_merged_bin=merge(data_full_autocorr,autocorrelation_check_data,by=c("Location","Transect","Person","Repeat"))
+data_full_autocorr_merged_bin_biol=Transformation_data(data_full_autocorr_merged_bin,type="presence-absence")
+data_full_autocorr_merged_bin_biol$Location=data_full_autocorr_merged_bin$Location
+data_full_autocorr_merged_bin_biol$Transect=data_full_autocorr_merged_bin$Transect
+data_full_autocorr_merged_bin_biol$Order=data_full_autocorr_merged_bin$Order
+data_full_autocorr_merged_bin_biol$Code_Transect=paste(data_full_autocorr_merged_bin_biol$Location,data_full_autocorr_merged_bin_biol$Transect)
+data_full_autocorr_merged_bin_biol$Person<-data_full_autocorr_merged_bin$Person
+data_full_autocorr_merged_bin_biol$fOrder=as.factor(data_full_autocorr_merged_bin_biol$Order)
+data_full_autocorr_merged_bin_biol$Island<-data_full_autocorr_merged_bin$Island
+data_full_autocorr_merged_bin_biol$Repeat<-as.numeric(data_full_autocorr_merged_bin$Repeat)
+data_full_autocorr_merged_bin_biol$Code_Transect_Person<-paste(data_full_autocorr_merged_bin$Code_Transect,data_full_autocorr_merged_bin$Person)
+data_full_autocorr_merged_bin_biol<-data_full_autocorr_merged_bin_biol[order(data_full_autocorr_merged_bin_biol$Location,data_full_autocorr_merged_bin_biol$Transect,data_full_autocorr_merged_bin_biol$Person,data_full_autocorr_merged_bin_biol$Repeat),]
+
+a=Transformation_data(data_full_autocorr_merged_bin_biol,type="no transformation")
+y=totaluniquevals(a)
+specieslist.SC<-specieslist
+
+stringToQuoser <- function(varName) {
+  wrapr::let(c(VARNAME = varName), quo(VARNAME))
+}
+
+for (j in 1:length(specieslist.SC)){
+  response <- stringToQuoser(specieslist.SC[j])
+  data_full_autocorr_merged_bin_biol_detected<-data_full_autocorr_merged_bin_biol %>%
+    dplyr::group_by(Code_Transect_Person) %>%
+    dplyr::summarize(presence=sum((!!response)))
+  data_full_autocorr_merged_bin_biol_for_model=data_full_autocorr_merged_bin_biol[which(data_full_autocorr_merged_bin_biol$Code_Transect_Person %in% data_full_autocorr_merged_bin_biol_detected$Code_Transect_Person[which(data_full_autocorr_merged_bin_biol_detected$presence!=0)]),]
+  if (length(which(data_full_autocorr_merged_bin_biol_detected$presence!=0))>1){
+    if (length(unique(data_full_autocorr_merged_bin_biol_for_model$Code_Transect))>1 & length(unique(data_full_autocorr_merged_bin_biol_for_model$Person))>1){mbin=glmer(as.formula(paste(specieslist.SC[j],"~1+Repeat+(1|Code_Transect)+(1|Person)")), data = data_full_autocorr_merged_bin_biol_for_model, family = binomial)
+    }
+    if (length(unique(data_full_autocorr_merged_bin_biol_for_model$Code_Transect))==1){mbin=glmer(as.formula(paste(specieslist.SC[j],"~1+Repeat+(1|Person)")), data = data_full_autocorr_merged_bin_biol_for_model, family = binomial)
+    }
+    if (length(unique(data_full_autocorr_merged_bin_biol_for_model$Person))==1){mbin=glmer(as.formula(paste(specieslist.SC[j],"~1+Repeat+(1|Code_Transect)")), data = data_full_autocorr_merged_bin_biol_for_model, family = binomial)
+    }
+  }
+  else {mbin=glm(as.formula(paste(specieslist.SC[j],"~1+Repeat")), data = data_full_autocorr_merged_bin_biol_for_model, family = binomial)}
+  print(summary(mbin))
+  r=as.data.frame(summary(mbin)$coefficients)
+  rownames(r)[1]=specieslist.SC[j]
+  if (j==1){
+    p=r
+  } else {p=rbind(p,r)}
+  data_full_autocorr_merged_bin_biol_for_graph<-data_full_autocorr_merged_bin_biol_for_model[,c(specieslist.SC[j],"Repeat","Code_Transect","Person")]
+  data_full_autocorr_merged_bin_biol_for_graph$Code_Transect_Person<-paste(data_full_autocorr_merged_bin_biol_for_graph$Code_Transect,data_full_autocorr_merged_bin_biol_for_graph$Person)
+  data_full_autocorr_merged_bin_biol_for_graph[,specieslist.SC[j]]=as.factor(data_full_autocorr_merged_bin_biol_for_graph[,specieslist.SC[j]])
+  data_full_autocorr_merged_bin_biol_for_graph[,"Code_Transect_Person"]=as.factor(data_full_autocorr_merged_bin_biol_for_graph[,"Code_Transect_Person"])
+  g1<-ggplot(data=data_full_autocorr_merged_bin_biol_for_graph,aes_string(x="Repeat",y=specieslist.SC[j]))+clean_theme()+geom_point(position = position_jitter(w = 0, h = 0.2),aes_string(color="Code_Transect_Person",shape=specieslist.SC[j]))+theme(legend.position = "none")+clean_theme+ggtitle(specieslist.SC[j])
+    #Plot presence and absence in function of ordered repeat with different colors for different transects
+ print(g1)
+}
+p[,c("Estimate","Std. Error","z value")]=round(p[,c("Estimate","Std. Error","z value")],digits = 2)
+p[,c("Pr(>|z|)")]=round(p[,c("Pr(>|z|)")],digits = 6)
+```
+
+```{r}
+#ACF (Autocorrelation function) for 18 repeats
+data_full_autocorr_merged_cont=merge(data_full_autocorr,autocorrelation_check_data,by=c("Location","Transect","Person","Repeat"))
+data_full_autocorr_merged_cont=data_full_autocorr_merged_cont[order(data_full_autocorr_merged_cont$Location,data_full_autocorr_merged_cont$Transect,data_full_autocorr_merged_cont$Order),]
+data=data_full_autocorr_merged_cont
+data.repeat.50.SC=data.repeat.50[which(data.repeat.50$Island=="SantaCruz"),]
+x=Transformation_data(data.repeat.50.SC,type="no transformation")
+specieslist.SC<-specieslist[-which(specieslist %in% names(which(colSums(x)==0)))]
+specieslist.SC=specieslist
+df=as.data.frame(matrix(ncol=9,nrow=length(specieslist.SC)))
+rownames(df)=specieslist.SC
+for (i in 1:length(specieslist.SC)){
+  x=as.data.frame(data[,c(specieslist.SC[i])])
+  x<-sqrt(sqrt(x))
+  p=as.data.frame(matrix(t(x), ncol=540/18, 
+          byrow=FALSE), stringsAsFactors=FALSE)
+  p=p[, colSums(p != 0) > 0]
+  if (is.data.frame(p)==FALSE){
+    rownumber=1
+  } else {rownumber=ncol(p)}
+  empty.df <- as.data.frame(matrix(ncol=9,nrow=rownumber))
+  for (j in 1:rownumber){
+    if (is.data.frame(p)==FALSE){z=p
+    } else {z=p[,j]}
+    acf_object=acf(z, na.action = na.pass,
+    main = "Auto-correlation plot for residuals")
+    print(acf_object)
+    empty.df[j,]=acf_object$acf
+  }
+  df[i,]=col_means(empty.df)
+}
+data_full_autocorr_merged_cont_df_acf=df
+data_full_autocorr_merged_cont_df_acf=round(data_full_autocorr_merged_cont_df_acf,digits=2)
+```
+
+```{r}
+#PACF (Partial Autocorrelation function) for 18 repeats
+data_full_autocorr_merged_cont=merge(data_full_autocorr,autocorrelation_check_data,by=c("Location","Transect","Person","Repeat"))
+data_full_autocorr_merged_cont=data_full_autocorr_merged_cont[order(data_full_autocorr_merged_cont$Location,data_full_autocorr_merged_cont$Transect,data_full_autocorr_merged_cont$Order),]
+data=data_full_autocorr_merged_cont
+df=as.data.frame(matrix(ncol=12,nrow=length(specieslist)))
+rownames(df)=specieslist
+for (i in 1:length(specieslist)){
+  x=as.data.frame(data[,c(specieslist[i])])
+  x<-sqrt(sqrt(x))
+  p=as.data.frame(matrix(t(x), ncol=540/18, 
+          byrow=FALSE), stringsAsFactors=FALSE)
+  p=p[, colSums(p != 0) > 0]
+  if (is.data.frame(p)==FALSE){
+    rownumber=1
+  } else {rownumber=ncol(p)}
+  empty.df <- as.data.frame(matrix(ncol=12,nrow=rownumber))
+  for (j in 1:rownumber){
+    if (is.data.frame(p)==FALSE){z=p
+    } else {z=p[,j]}
+    acf_object=pacf(z, na.action = na.pass,
+    main = "Auto-correlation plot for residuals")
+    print(acf_object)
+    empty.df[j,]=acf_object$acf
+  }
+  df[i,]=col_means(empty.df)
+}
+data_full_autocorr_merged_cont_df_pacf=df
+```
+
+```{r}
+#Generate boxplots per factor
+general_boxplot<-function(data.repeat.50,response){
+  print(ggboxplot(data=data.repeat.50, x = "Island", y = response,main=response))
+  print(ggboxplot(data=data.repeat.50, x = "Location", y = response, color = "Island",main=response))
+  print(ggboxplot(data=data.repeat.50, x = "Code_Transect", y = response, color = "Location",main=response))
+  print(ggboxplot(data=data.repeat.50, x = "Code", y = response, color = "Location",main=response))
+  print(ggboxplot(data=data.repeat.50, x = "Code", y = response, color = "Person",main=response))
+
+}
+
+```
+
+```{r}
+general_boxplot(data.repeat.50,"amarillosnapper")
+```
+
+```{r}
+for (i in unique(data.repeat.50$Location)){
+  for (j in unique(data.repeat.50$Transect)){
+    for (k in unique(data.repeat.50$Person)){
+      print(plot(as.numeric(data.repeat.50$Repeat[which(data.repeat.50$Location==i & 
+                                  data.repeat.50$Transect==j &
+                                  data.repeat.50$Person==k)]),
+           data.repeat.50$totalamountofspecies[which(data.repeat.50$Location==i & 
+                                  data.repeat.50$Transect==j &
+                                  data.repeat.50$Person==k)]))
+    }
+  }
+}
+plot(data.repeat.50$Repeat,data.repeat.50$totalamountofspecies)
+```
+
+```{r echo=FALSE}
+#Basic NMDS
+BASIC_NMDS<-function(data.repeat){
+  set.seed(123)
+  community_matrix=Transformation_data(data.repeat,"no transformation")
+  if (any(rowSums(community_matrix)==0)){
+    data.repeat=data.repeat[-which(rowSums(community_matrix)==0),]
+    community_matrix=community_matrix[-which(rowSums(community_matrix)==0),]
+  }
+  
+  data_NMDS=metaMDS(community_matrix, # Our community-by-species matrix
+                       k=2, # The number of reduced dimensions
+                    trymax=1) 
+  
+  stressplot(data_NMDS)
+  print(plot(data_NMDS))
+  ordiplot(data_NMDS,type="n")
+  ordihull(data_NMDS,groups=data.repeat$Location,draw="polygon",col="grey90",label=F)
+  orditorp(data_NMDS,display="species",col="red",air=0.01)
+  orditorp(data_NMDS,display="sites",col=c(rep("green",5),rep("blue",5)),
+     air=0.01,cex=0.1)
+}
+```
+
+```{r echo=FALSE}
+BASIC_NMDS(data.repeat.50)
+```
+
+```{r}
+#Plot results of permanova as pie
+Personal_pyplot<-function(data,title,type){
+  if (type=="adonis"){
+    data=data$aov.tab
+  }
+  data=data[-nrow(data),]
+  s <- list(
+    family = "Times New Roman",
+    size = 35,
+    color = 'white')
+  
+  m <- list(
+    l = 100,
+    r = 100,
+    b = 200,
+    t = 100,
+    pad = 4
+  )
+  substrRight <- function(x, n){
+  substr(x, nchar(x)-n+1, nchar(x))
+  }
+  abiotic.biotic <- plot_ly(sort=FALSE) %>% 
+    add_pie(data=data, labels = rownames(data), values = ~R2, type = 'pie',
+            textposition = 'outside',
+            textinfo = 'label+percent',
+            #insidetextfont = list(color = '#FFFFFF'),
+            insidetextfont = s,
+            #hoverinfo = 'text',
+            #text = ~paste( Amount, ' publications'),
+            marker = list(colors = colors,
+                          line = list(color = '#FFFFFF', width = 1)),
+            #The 'pull' attribute can also be used to create space between the sectors
+            showlegend = FALSE,
+            domain = list(x = c(0, 0.47), y = c(0, 1))) %>%
+    layout(title = title,
+            xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+            yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),font=t,
+           margin=m) 
+    #add_annotations(a)
+  print(abiotic.biotic)
+  g<-ggplot(data=data,aes(x=rownames(data),y=R2))
+  g<-g+geom_bar(stat="identity")
+  g<-g+theme(axis.text.x = element_text(angle = 90, hjust = 1))+xlab("Factor")+ylab("R?")+ylim(low=0, high=1)
+  print(g)
+}
+```
+
+```{r}
+#Plot results of permanova as multiple pies
+Personal_pyplot_multiple<-function(data.10,data.20,data.30,data.40,data.50,type){
+  if (type=="adonis"){
+    data=data$aov.tab
+  }
+  data=data[-nrow(data),]
+  s <- list(
+    family = "Times New Roman",
+    size = 35,
+    color = 'white')
+  
+  m <- list(
+    l = 100,
+    r = 100,
+    b = 200,
+    t = 100,
+    pad = 4
+  )
+  abiotic.biotic <- plot_ly(sort=FALSE) %>% 
+    add_pie(data=data.10, labels = rownames(data.10), values = ~R2, type = 'pie',
+            textposition = 'outside',
+            textinfo = 'label+percent',
+            #insidetextfont = list(color = '#FFFFFF'),
+            insidetextfont = s,
+            #hoverinfo = 'text',
+            #text = ~paste( Amount, ' publications'),
+            marker = list(colors = colors,
+                          line = list(color = '#FFFFFF', width = 1)),
+            #The 'pull' attribute can also be used to create space between the sectors
+            showlegend = TRUE,
+            domain = list(x = c(0, 0.31), y = c(0, 0.45))) %>%
+    add_pie(data=data.20, labels = rownames(data.20), values = ~R2, type = 'pie',
+            textposition = 'outside',
+            textinfo = 'label+percent',
+            #insidetextfont = list(color = '#FFFFFF'),
+            insidetextfont = s,
+            #hoverinfo = 'text',
+            #text = ~paste( Amount, ' publications'),
+            marker = list(colors = colors,
+                          line = list(color = '#FFFFFF', width = 1)),
+            #The 'pull' attribute can also be used to create space between the sectors
+            showlegend = FALSE,
+            domain = list(x = c(0.34, 0.65), y = c(0, 0.45))) %>%
+    add_pie(data=data.30, labels = rownames(data.30), values = ~R2, type = 'pie',
+            textposition = 'outside',
+            textinfo = 'label+percent',
+            #insidetextfont = list(color = '#FFFFFF'),
+            insidetextfont = s,
+            #hoverinfo = 'text',
+            #text = ~paste( Amount, ' publications'),
+            marker = list(colors = colors,
+                          line = list(color = '#FFFFFF', width = 1)),
+            #The 'pull' attribute can also be used to create space between the sectors
+            showlegend = FALSE,
+            domain = list(x = c(0.68, 1.0), y = c(0, 0.45))) %>%
+    add_pie(data=data.40, labels = rownames(data.40), values = ~R2, type = 'pie',
+            textposition = 'outside',
+            textinfo = 'label+percent',
+            #insidetextfont = list(color = '#FFFFFF'),
+            insidetextfont = s,
+            #hoverinfo = 'text',
+            #text = ~paste( Amount, ' publications'),
+            marker = list(colors = colors,
+                          line = list(color = '#FFFFFF', width = 1)),
+            #The 'pull' attribute can also be used to create space between the sectors
+            showlegend = FALSE,
+            domain = list(x = c(0, 0.31), y = c(0.55, 1))) %>%
+    add_pie(data=data.50, labels = rownames(data.50), values = ~R2, type = 'pie',
+            textposition = 'outside',
+            textinfo = 'label+percent',
+            #insidetextfont = list(color = '#FFFFFF'),
+            insidetextfont = s,
+            #hoverinfo = 'text',
+            #text = ~paste( Amount, ' publications'),
+            marker = list(colors = colors,
+                          line = list(color = '#FFFFFF', width = 1)),
+            #The 'pull' attribute can also be used to create space between the sectors
+            showlegend = FALSE,
+            domain = list(x = c(0.34, 0.65), y = c(0.55, 1))) %>%
+    layout(#title = 'Use of abiotic and biotic data acquisition methods in SDM studies of fish which incorporate movement',
+            xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+            yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),font=t,
+           margin=m) 
+    #add_annotations(a)
+  print(abiotic.biotic)
+}
+```
+
+```{r}
+#Plot results of permanova as 2 pies
+Personal_pyplot_pair<-function(data.10,data.20,type){
+  if (type=="adonis"){
+    data.10=data.10$aov.tab
+    data.20=data.20$aov.tab
+  }
+  data.10=data.10[-nrow(data.10),]
+  data.20=data.20[-nrow(data.20),]
+  s <- list(
+    family = "Times New Roman",
+    size = 35,
+    color = 'white')
+  
+  m <- list(
+    l = 100,
+    r = 100,
+    b = 200,
+    t = 100,
+    pad = 4
+  )
+  abiotic.biotic <- plot_ly(sort=FALSE) %>% 
+    add_pie(data=data.10, labels = rownames(data.10), values = ~R2, type = 'pie',
+            textposition = 'outside',
+            textinfo = 'label+percent',
+            #insidetextfont = list(color = '#FFFFFF'),
+            insidetextfont = s,
+            #hoverinfo = 'text',
+            #text = ~paste( Amount, ' publications'),
+            marker = list(colors = colors,
+                          line = list(color = '#FFFFFF', width = 1)),
+            #The 'pull' attribute can also be used to create space between the sectors
+            showlegend = TRUE,
+            domain = list(x = c(0, 0.45), y = c(0, 47))) %>%
+    add_pie(data=data.20, labels = rownames(data.20), values = ~R2, type = 'pie',
+            textposition = 'outside',
+            textinfo = 'label+percent',
+            #insidetextfont = list(color = '#FFFFFF'),
+            insidetextfont = s,
+            #hoverinfo = 'text',
+            #text = ~paste( Amount, ' publications'),
+            marker = list(colors = colors,
+                          line = list(color = '#FFFFFF', width = 1)),
+            #The 'pull' attribute can also be used to create space between the sectors
+            showlegend = FALSE,
+            domain = list(x = c(0.55, 1.00), y = c(0, 47))) %>%
+    # add_pie(data=data.30, labels = rownames(data.30), values = ~R2, type = 'pie',
+    #         textposition = 'outside',
+    #         textinfo = 'label+percent',
+    #         #insidetextfont = list(color = '#FFFFFF'),
+    #         insidetextfont = s,
+    #         #hoverinfo = 'text',
+    #         #text = ~paste( Amount, ' publications'),
+    #         marker = list(colors = colors,
+    #                       line = list(color = '#FFFFFF', width = 1)),
+    #         #The 'pull' attribute can also be used to create space between the sectors
+    #         showlegend = FALSE,
+    #         domain = list(x = c(0.68, 1.0), y = c(0, 0.45))) %>%
+    # add_pie(data=data.40, labels = rownames(data.40), values = ~R2, type = 'pie',
+    #         textposition = 'outside',
+    #         textinfo = 'label+percent',
+    #         #insidetextfont = list(color = '#FFFFFF'),
+    #         insidetextfont = s,
+    #         #hoverinfo = 'text',
+    #         #text = ~paste( Amount, ' publications'),
+    #         marker = list(colors = colors,
+    #                       line = list(color = '#FFFFFF', width = 1)),
+    #         #The 'pull' attribute can also be used to create space between the sectors
+    #         showlegend = FALSE,
+    #         domain = list(x = c(0, 0.31), y = c(0.55, 1))) %>%
+    # add_pie(data=data.50, labels = rownames(data.50), values = ~R2, type = 'pie',
+    #         textposition = 'outside',
+    #         textinfo = 'label+percent',
+    #         #insidetextfont = list(color = '#FFFFFF'),
+    #         insidetextfont = s,
+    #         #hoverinfo = 'text',
+    #         #text = ~paste( Amount, ' publications'),
+    #         marker = list(colors = colors,
+    #                       line = list(color = '#FFFFFF', width = 1)),
+    #         #The 'pull' attribute can also be used to create space between the sectors
+    #         showlegend = FALSE,
+    #         domain = list(x = c(0.34, 0.65), y = c(0.55, 1))) %>%
+    layout(#title = 'Use of abiotic and biotic data acquisition methods in SDM studies of fish which incorporate movement',
+            xaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),
+            yaxis = list(showgrid = FALSE, zeroline = FALSE, showticklabels = FALSE),font=t,
+           margin=m) 
+    #add_annotations(a)
+  print(abiotic.biotic)
+  return(abiotic.biotic)
+}
+```
+
+PERMANOVA results testing for differences in number of species indicate no significant effect of island and person analyzing the videos. The order of the variables does not have an effect because of the balanced design. 
+
+```{r}
+#Turn empty elements (NA) into 0 values
+data.repeat.10[is.na(data.repeat.10)==TRUE]=0
+data.repeat.20[is.na(data.repeat.20)==TRUE]=0
+data.repeat.30[is.na(data.repeat.30)==TRUE]=0
+data.repeat.40[is.na(data.repeat.40)==TRUE]=0
+data.repeat.50[is.na(data.repeat.50)==TRUE]=0
+```
+
+
+```{r}
+#PERMANOVA species density
+totalamountofspecies<-data.repeat.10$totalamountofspecies
+perm.species.amount.10<-adonis2(totalamountofspecies~Island + Location %in% Island + Code_Transect %in% Location + Person + Person:Island + Person:Location + Person:Code_Transect,data=data.repeat.10, permutations = 9)
+print(perm.species.amount.10)
+totalamountofspecies<-data.repeat.20$totalamountofspecies
+perm.species.amount.20<-adonis2(totalamountofspecies~Island + Location %in% Island + Code_Transect %in% Location + Person + Person:Island + Person:Location + Person:Code_Transect,data=data.repeat.20, permutations = 9)
+print(perm.species.amount.20)
+totalamountofspecies<-data.repeat.30$totalamountofspecies
+perm.species.amount.30<-adonis2(totalamountofspecies~Island + Location %in% Island + Code_Transect %in% Location + Person + Person:Island + Person:Location + Person:Code_Transect,data=data.repeat.30, permutations = 9)
+print(perm.species.amount.30)
+totalamountofspecies<-data.repeat.40$totalamountofspecies
+perm.species.amount.40<-adonis2(totalamountofspecies~Island + Location %in% Island + Code_Transect %in% Location + Person + Person:Island + Person:Location + Person:Code_Transect,data=data.repeat.40, permutations = 9)
+print(perm.species.amount.40)
+totalamountofspecies<-data.repeat.50$totalamountofspecies
+perm.species.amount.50<-adonis2(totalamountofspecies~Island + Location %in% Island + Code_Transect %in% Location + Person + Person:Island + Person:Location + Person:Code_Transect,data=data.repeat.50, permutations = 9)
+print(perm.species.amount.50)
+
+```
+
+```{r}
+#plot results permanova species density
+Personal_pyplot(perm.species.amount.10,"PERMANOVA of species richness (10 meter transects)","adonis2")
+Personal_pyplot(perm.species.amount.20,"PERMANOVA of species richness (20 meter transects)","adonis2")
+Personal_pyplot(perm.species.amount.30,"PERMANOVA of species richness (30 meter transects)","adonis2")
+Personal_pyplot(perm.species.amount.40,"PERMANOVA of species richness (40 meter transects)","adonis2")
+Personal_pyplot(perm.species.amount.50,"PERMANOVA of species richness (50 meter transects)","adonis2")
+```
+
+```{r echo=FALSE}
+#Determine Bray Curtis Dissimilarities and perform PERMANOVA for entire dataset
+Personal_PERMANOVA<-function(data.repeat,factors,response,algo,type,transform="4root",method='bray',binary=FALSE){
+  #set.seed(123)
+  fish.mat=Transformation_data(data.repeat,transform)
+  if (any(rowSums(fish.mat)==0)){
+    data.repeat=data.repeat[-which(rowSums(fish.mat)==0),]
+    fish.mat=fish.mat[-which(rowSums(fish.mat)==0),]
+  }
+  fish.dist=vegdist(fish.mat, method=method,binary=binary)
+  .form=as.formula(paste(response,"~", paste(factors, collapse=algo)))
+  if (type=="adonis2"){
+    fish.div<-adonis2(.form, data=data.repeat, permutations = 999, method=method)
+  }
+  if (type=="adonis"){
+    fish.div<-adonis(.form, data=data.repeat, permutations = 999, method=method)
+  }
+  print(fish.div)
+  print(densityplot(permustats(fish.div)))
+  return(fish.div)
+}
+#Determine Bray Curtis Dissimilarities and perform PERMANOVA for entire dataset using strata
+Personal_PERMANOVA_strata<-function(data.repeat,.form,type){
+  fish.mat=Transformation_data(data.repeat,"4root")
+  if (any(rowSums(fish.mat)==0)){
+    data.repeat=data.repeat[-which(rowSums(fish.mat)==0),]
+    fish.mat=fish.mat[-which(rowSums(fish.mat)==0),]
+  }
+  fish.dist=vegdist(fish.mat, method='bray')
+  if (type=="adonis2"){
+    fish.div<-adonis2(.form, data=data.repeat, permutations = 999, method="bray")
+  }
+  if (type=="adonis"){
+    fish.div<-adonis(.form, data=data.repeat, permutations = 999, method="bray")
+  }
+  print(fish.div)
+  print(densityplot(permustats(fish.div)))
+  return(fish.div)
+}
+```
+
+```{r}
+#Run different PERMANOVA analyses for structure fish communities using different methods to calculate the dissimilarity matrix and differnt formulae notations
+
+fish.div.data.repeat.10<-Personal_PERMANOVA(data.repeat.10,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis")
+fish.div.data.repeat.20<-Personal_PERMANOVA(data.repeat.20,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis")
+fish.div.data.repeat.30<-Personal_PERMANOVA(data.repeat.30,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis")
+fish.div.data.repeat.40<-Personal_PERMANOVA(data.repeat.40,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis")
+fish.div.data.repeat.50<-Personal_PERMANOVA(data.repeat.50,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis")
+
+fish.div.data.repeat.10.jac<-Personal_PERMANOVA(data.repeat.10,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis",method="jaccard")
+fish.div.data.repeat.20.jac<-Personal_PERMANOVA(data.repeat.20,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis",method="jaccard")
+fish.div.data.repeat.30.jac<-Personal_PERMANOVA(data.repeat.30,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis",method="jaccard")
+fish.div.data.repeat.40.jac<-Personal_PERMANOVA(data.repeat.40,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis",method="jaccard")
+fish.div.data.repeat.50.jac<-Personal_PERMANOVA(data.repeat.50,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis",method="jaccard")
+
+fish.div.data.repeat.10.sor<-Personal_PERMANOVA(data.repeat.10,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis",binary=TRUE)
+fish.div.data.repeat.20.sor<-Personal_PERMANOVA(data.repeat.20,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis",binary=TRUE)
+fish.div.data.repeat.30.sor<-Personal_PERMANOVA(data.repeat.30,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis",binary=TRUE)
+fish.div.data.repeat.40.sor<-Personal_PERMANOVA(data.repeat.40,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis",binary=TRUE)
+fish.div.data.repeat.50.sor<-Personal_PERMANOVA(data.repeat.50,c('Island','Location','Code_Transect','Person'),'fish.dist','*',"adonis",binary=TRUE)
+
+fish.div.data.repeat.50.strata.1<-Personal_PERMANOVA(data.repeat.50,c('Island','Location','Code_Transect','Person'),'fish.dist','+',"adonis")
+fish.div.data.repeat.50.strata.2<-Personal_PERMANOVA(data.repeat.50,c('Person','Location','Code_Transect','Island'),'fish.dist','+',"adonis")
+fish.div.data.repeat.50.strata.3<-Personal_PERMANOVA_strata(data.repeat.50,as.formula(paste('fish.dist ~ Island + Location + Code_Transect + Person')),"adonis")
+fish.div.data.repeat.50.strata.4<-Personal_PERMANOVA_strata(data.repeat.50,as.formula(paste('fish.dist ~ Island + Location %in% Island + Code_Transect %in% Location')),"adonis")
+fish.div.data.repeat.50.strata.5<-Personal_PERMANOVA_strata(data.repeat.50,as.formula(paste('fish.dist ~ Island + Location %in% Island + Code_Transect %in% Location + Person + Person:Island + Person:Location + Person:Code_Transect')),"adonis")
+fish.div.data.repeat.50.strata.6<-Personal_PERMANOVA_strata(data.repeat.50,as.formula(paste('fish.dist ~ Island/Location/Code_Transect + Person + Person:Island + Person:Location + Person:Code_Transect')),"adonis")
+fish.div.data.repeat.50.strata.7<-Personal_PERMANOVA_strata(data.repeat.50,as.formula(paste('fish.dist ~ Island + Code_Transect %in% Location + Location %in% Island + Person')),"adonis")
+
+#Different formulae notations yield the same result.
+```
+
+```{r}
+#Plot results permanova structure fish communities
+rownames(fish.div.data.repeat.10$aov.tab)[3]="Transect"
+rownames(fish.div.data.repeat.10$aov.tab)[4]="Observer"
+rownames(fish.div.data.repeat.10$aov.tab)[5]="Island:Observer"
+rownames(fish.div.data.repeat.10$aov.tab)[6]="Location:Observer"
+rownames(fish.div.data.repeat.10$aov.tab)[7]="Transect:Observer"
+rownames(fish.div.data.repeat.50$aov.tab)[3]="Transect"
+rownames(fish.div.data.repeat.50$aov.tab)[4]="Observer"
+rownames(fish.div.data.repeat.50$aov.tab)[5]="Island:Observer"
+rownames(fish.div.data.repeat.50$aov.tab)[6]="Location:Observer"
+rownames(fish.div.data.repeat.50$aov.tab)[7]="Transect:Observer"
+Personal_pyplot(fish.div.data.repeat.10,"PERMANOVA of fish community (10 meter transects)","adonis")
+Personal_pyplot(fish.div.data.repeat.20,"PERMANOVA of fish community (20 meter transects)","adonis")
+Personal_pyplot(fish.div.data.repeat.30,"PERMANOVA of fish community (30 meter transects)","adonis")
+Personal_pyplot(fish.div.data.repeat.40,"PERMANOVA of fish community (40 meter transects)","adonis")
+Personal_pyplot(fish.div.data.repeat.50,"PERMANOVA of fish community (50 meter transects)","adonis")
+Personal_pyplot_pair(fish.div.data.repeat.10,fish.div.data.repeat.50,"adonis")
+```
+
+```{r echo=FALSE}
+#Assess multivariate dispersion
+Personal_DISPERSION<-function(data.repeat,group){
+  set.seed(123)
+  fish.mat=Transformation_data(data.repeat,"4root")
+  if (any(rowSums(fish.mat)==0)){
+    data.repeat=data.repeat[-which(rowSums(fish.mat)==0),]
+    fish.mat=fish.mat[-which(rowSums(fish.mat)==0),]
+  }
+  fish.dist=vegdist(fish.mat, method='bray')
+  dispersion<-betadisper(fish.dist, group=lapply(data.repeat[,group],as.character)[[1]])
+  dispersion
+  print(anova(dispersion))
+  boxplot(dispersion,xlab=group) #plot average distance to the centroid
+  print(permutest(dispersion))
+  plot(dispersion, hull=TRUE, ellipse=TRUE,label=TRUE,main=group,xlab="PCoA1",ylab="PCoA2") #sd ellipse: Higher spread: Higher betadiversity  
+}
+Personal_DISPERSION(data.repeat.10,"Location")
+Personal_DISPERSION(data.repeat.20,"Location")
+Personal_DISPERSION(data.repeat.30,"Location")
+Personal_DISPERSION(data.repeat.40,"Location")
+Personal_DISPERSION(data.repeat.50,"Location")
+Personal_DISPERSION(data.repeat[which(data.repeat$Person=="Amber"),],"Location")
+Personal_DISPERSION(data.repeat[which(data.repeat$Person=="Long"),],"Location")
+Personal_DISPERSION(data.repeat[which(data.repeat$Person=="Heleen"),],"Location")
+Personal_DISPERSION(data.repeat,"Location")
+Personal_DISPERSION(data.repeat.10,"Person")
+Personal_DISPERSION(data.repeat.20,"Person")
+Personal_DISPERSION(data.repeat.30,"Person")
+Personal_DISPERSION(data.repeat.40,"Person")
+Personal_DISPERSION(data.repeat.50,"Person")
+Personal_DISPERSION(data.repeat.10,"Code_Transect")
+Personal_DISPERSION(data.repeat.20,"Code_Transect")
+Personal_DISPERSION(data.repeat.30,"Code_Transect")
+Personal_DISPERSION(data.repeat.40,"Code_Transect")
+Personal_DISPERSION(data.repeat.50,"Code_Transect")
+Personal_DISPERSION(data.repeat.10,"Island")
+Personal_DISPERSION(data.repeat.20,"Island")
+Personal_DISPERSION(data.repeat.30,"Island")
+Personal_DISPERSION(data.repeat.40,"Island")
+```
+
+##Plotting of NMDS of all 10 locations with group: Transect
+
+##Plotting of NMDS at three different sample durations
+
+##Assessment of precision of species richness and H with data pooled over 1.Persons and 2.Transects and 3.Persons and Transects. For this we will use bootstraps.
+
+```{r}
+#Create vector with random numbers
+personal_RANDOM_VECTOR<-function(number.of.repeats){
+  floor(runif(number.of.repeats, min=1, max=19))
+}
+```
+
+```{r}
+#3 to 18 repeats
+# Sets string to type allowing input in functions
+stringToQuoser <- function(varName) {
+  wrapr::let(c(VARNAME = varName), quo(VARNAME))
+}
+# determine univariate precision as the inverse of the standard error over the mean
+determine_precision<-function(data.repeat,response,TransectLength){
+  data.repeat[which(is.na(data.repeat[,response])==TRUE),response]=0
+  response <- stringToQuoser(response)
+  combinations <- expand.grid(Location=unique(data.repeat$Location),Transect=unique(data.repeat$Transect),Repeat=c(3:18),stringsAsFactors = FALSE)
+  combinations$precision_average<-NA
+  combinations$precision_sd<-NA
+  data.repeat.split=split(data.repeat,f=list(data.repeat$Location,data.repeat$Transect))
+  for (i in 1:length(data.repeat.split)){
+    Location=data.repeat.split[[i]][[1,"Location"]]
+    Transect=data.repeat.split[[i]][[1,"Transect"]]
+    for (number.of.repeats in 3:18){
+      precision=vector(mode="double",length=10)
+      for (j in 1:10){
+        x=data.repeat.split[[i]][personal_RANDOM_VECTOR(number.of.repeats),]
+        x_estimations<-x %>%
+        dplyr::summarize(average_SR=mean((!!response),na.rm=TRUE),
+                          sd_SR=sd((!!response),na.rm=TRUE))
+        precision[j]=(x_estimations$sd_SR/sqrt(number.of.repeats))/x_estimations$average_SR
+      }
+      precision_average=mean(precision,na.rm=TRUE)
+      precision_sd=sd(precision,na.rm=TRUE)
+      combinations$precision_average[which(combinations$Location==Location & combinations$Transect==Transect & combinations$Repeat==number.of.repeats)]=precision_average
+      combinations$precision_sd[which(combinations$Location==Location & combinations$Transect==Transect & combinations$Repeat==number.of.repeats)]=precision_sd
+    }
+  }
+  combinations$total_distance<-TransectLength*combinations$Repeat
+  return(combinations)
+}
+#Determine the average precision per repeat with confidence interval
+average_precision_per_repeat<-function(combinations){
+  k=nrow(combinations)/length(unique(combinations$Repeat))
+  precision<-combinations %>%
+    dplyr::group_by(Repeat) %>%
+    dplyr::summarize(precision=mean(precision_average,na.rm=TRUE),
+                     precision_sd=sqrt(sum(precision_sd^2,na.rm=TRUE)/k))
+  precision$low_conf_mean<-precision$precision-qt(0.975,df=k-1)*precision$precision_sd/sqrt(k)
+  precision$high_conf_mean<-precision$precision+qt(0.975,df=k-1)*precision$precision_sd/sqrt(k)
+  return(precision)
+}
+#Combine precision estimates
+combine_combinations<-function(combo1,combo2,combo3,combo4,combo5){
+  combo.combo<-rbind(combo1,combo2,combo3,combo4,combo5)
+  k=nrow(combo.combo)/(length(unique(combo.combo$Repeat))*length(unique(combo.combo$TransectLength)))
+  combo.combo.average<-combo.combo %>%
+    dplyr::group_by(Repeat,TransectLength) %>%
+    dplyr::summarize(precision_average=mean(precision_average,na.rm=TRUE),
+                     precision_sd=sqrt(sum(precision_sd^2,na.rm=TRUE)/k))
+  combo.combo.average$total.distance<-combo.combo.average$Repeat*combo.combo.average$TransectLength
+  combo.combo.average$average_ratio=(1/combo.combo.average$precision_average)/combo.combo.average$total.distance
+  g<-ggplot(data=combo.combo.average,aes(x=Repeat,y=average_ratio))+geom_point(aes(color=factor(TransectLength)))
+  print(g)
+  return(combo.combo.average)
+}
+
+```
+
+```{r}
+#precision for species density
+combinations.10.SR<-determine_precision(data.repeat.10,"totalamountofspecies",10)
+combinations.20.SR<-determine_precision(data.repeat.20,"totalamountofspecies",20)
+combinations.30.SR<-determine_precision(data.repeat.30,"totalamountofspecies",30)
+combinations.40.SR<-determine_precision(data.repeat.40,"totalamountofspecies",40)
+combinations.50.SR<-determine_precision(data.repeat.50,"totalamountofspecies",50)
+```
+
+```{r}
+#precision for H
+combinations.10.H<-determine_precision(data.repeat.10,"H",10)
+combinations.20.H<-determine_precision(data.repeat.20,"H",20)
+combinations.30.H<-determine_precision(data.repeat.30,"H",30)
+combinations.40.H<-determine_precision(data.repeat.40,"H",40)
+combinations.50.H<-determine_precision(data.repeat.50,"H",50)
+```
+
+```{r}
+#precision for count amarillosnapper
+combinations.10.amarillosnapper<-determine_precision(data.repeat.10,"amarillosnapper",10)
+combinations.20.amarillosnapper<-determine_precision(data.repeat.20,"amarillosnapper",20)
+combinations.30.amarillosnapper<-determine_precision(data.repeat.30,"amarillosnapper",30)
+combinations.40.amarillosnapper<-determine_precision(data.repeat.40,"amarillosnapper",40)
+combinations.50.amarillosnapper<-determine_precision(data.repeat.50,"amarillosnapper",50)
+```
+
+```{r}
+#combinations for precision for all species
+for (i in 1:length(specieslist)){
+  directory=paste("./combinations/",specieslist[i],sep="")
+  dir.create(directory)
+  combinations.loop.10<-determine_precision(data.repeat.10,specieslist[i],10)
+  filename=paste(directory,"/combinations.loop.10.csv",sep="")
+  write.csv(combinations.loop.10,filename)
+
+  combinations.loop.20<-determine_precision(data.repeat.20,specieslist[i],20)
+  filename=paste(directory,"/combinations.loop.20.csv",sep="")
+  write.csv(combinations.loop.20,filename)
+
+  combinations.loop.30<-determine_precision(data.repeat.30,specieslist[i],30)
+  filename=paste(directory,"/combinations.loop.30.csv",sep="")
+  write.csv(combinations.loop.30,filename)
+
+  combinations.loop.40<-determine_precision(data.repeat.40,specieslist[i],40)
+  filename=paste(directory,"/combinations.loop.40.csv",sep="")
+  write.csv(combinations.loop.40,filename)
+
+  combinations.loop.50<-determine_precision(data.repeat.50,specieslist[i],50)
+  filename=paste(directory,"/combinations.loop.50.csv",sep="")
+  write.csv(combinations.loop.50,filename)
+}
+```
+
+```{r warning=FALSE}
+#Determine precision for different distances
+precision.10<-average_precision_per_repeat(combinations.10.SR)
+precision.20<-average_precision_per_repeat(combinations.20.SR)
+precision.30<-average_precision_per_repeat(combinations.30.SR)
+precision.40<-average_precision_per_repeat(combinations.40.SR)
+precision.50<-average_precision_per_repeat(combinations.50.SR)
+precision.10$distance<-10
+precision.20$distance<-20
+precision.30$distance<-30
+precision.40$distance<-40
+precision.50$distance<-50
+precision.10$TransectLength<-"10 meter"
+precision.20$TransectLength<-"20 meter"
+precision.30$TransectLength<-"30 meter"
+precision.40$TransectLength<-"40 meter"
+precision.50$TransectLength<-"50 meter"
+precision.combo<-rbind(precision.10,precision.20,precision.30,precision.40,precision.50)
+
+precision.combo$total.distance<-precision.combo$Repeat*precision.combo$distance
+precision.combo$ratio1=(1/precision.combo$precision)/precision.combo$total.distance
+precision.combo$ratio2=(precision.combo$precision)/precision.combo$total.distance
+
+g1<-ggplot(data = precision.combo,aes(x=Repeat,y=precision,group=TransectLength))
+g1<-g1+geom_line(aes(colour=TransectLength),size=1)+geom_point()
+xmax=20
+ymax=0.25
+g1<-g1+xlab("Number of repeats")+ylab("SE/mean")+xlim(0,xmax)+ylim(0,ymax)
+g1<-g1+geom_ribbon(data=precision.combo,aes(x=Repeat,ymin=low_conf_mean,ymax=high_conf_mean,fill=TransectLength,colour=TransectLength),alpha=0.2)+
+  theme(legend.title=element_text(size=10), legend.text=element_text(size=10),
+                           legend.justification=c(0.25,0.25),legend.key.size =  unit(0.1, "in"),
+                           legend.position=c(0.80, 0.7),
+                           #panel.grid.major = element_blank(),
+                           axis.line = element_line(colour = "black"),
+                           text=element_text(size=8,  family="serif"),
+                           panel.background = element_rect(fill = "white", colour = NA),
+                           panel.grid.major = element_line(colour = "gray"),
+                           panel.grid.minor = element_blank(),
+                           axis.title = element_text(size = rel(1), colour = "black"),
+                           axis.text = element_text(size = rel(1), colour = "black"),
+                           line = element_line(colour = "black", size = 0.25, linetype = 1, lineend = "butt"))+
+          annotate("text", x=xmax/10, y=ymax-ymax/10, label= "(A)" ,size=4,family="serif")
+# g<-g+geom_errorbar(data=precision.combo,aes(x=Repeat,ymin=low_conf_mean,ymax=high_conf_mean,colour=TransectLength),alpha=1)
+A<-g1
+A
+
+a<-ggplot(data=precision.combo,aes(x=Repeat,y=ratio1))+geom_point(aes(color=TransectLength))
+a
+b<-ggplot(data=precision.combo,aes(x=Repeat,y=ratio2))+geom_point(aes(color=TransectLength))
+b
+xmax=1000
+ymax=0.25
+c<-ggplot(data=precision.combo,aes(x=total.distance,y=precision))+geom_point(aes(color=TransectLength))+geom_line(aes(color=TransectLength))+xlim(0,xmax)+ylim(0,ymax)+xlab("Total distance (m)")+ylab("SE/mean")
+c<-c+theme(legend.title=element_text(size=10), legend.text=element_text(size=10),
+                           legend.justification=c(0.25,0.25),legend.key.size =  unit(0.1, "in"),
+                           legend.position=c(0.80, 0.7),
+                           #panel.grid.major = element_blank(),
+                           axis.line = element_line(colour = "black"),
+                           text=element_text(size=8,  family="serif"),
+                           panel.background = element_rect(fill = "white", colour = NA),
+                           panel.grid.major = element_line(colour = "gray"),
+                           panel.grid.minor = element_blank(),
+                           axis.title = element_text(size = rel(1), colour = "black"),
+                           axis.text = element_text(size = rel(1), colour = "black"),
+                           line = element_line(colour = "black", size = 0.25, linetype = 1, lineend = "butt"))+
+          annotate("text", x=xmax/10, y=ymax-ymax/10, label= "(B)" ,size=4,family="serif")
+c<-c+geom_errorbar(data=precision.combo,aes(x=total.distance,ymin=low_conf_mean,ymax=high_conf_mean,fill=TransectLength,colour=TransectLength),alpha=0.6)
+B<-c
+B
+precision.combo$fRepeat<-as.factor(precision.combo$Repeat)
+d<-ggplot(data=precision.combo,aes(x=total.distance,y=precision))+geom_point(aes(color=fRepeat))
+d
+```
+
+```{r warning=FALSE}
+#Determine precision for different distances: H
+precision.10<-average_precision_per_repeat(combinations.10.H)
+precision.20<-average_precision_per_repeat(combinations.20.H)
+precision.30<-average_precision_per_repeat(combinations.30.H)
+precision.40<-average_precision_per_repeat(combinations.40.H)
+precision.50<-average_precision_per_repeat(combinations.50.H)
+precision.10$distance<-10
+precision.20$distance<-20
+precision.30$distance<-30
+precision.40$distance<-40
+precision.50$distance<-50
+precision.10$TransectLength<-"10 meter"
+precision.20$TransectLength<-"20 meter"
+precision.30$TransectLength<-"30 meter"
+precision.40$TransectLength<-"40 meter"
+precision.50$TransectLength<-"50 meter"
+precision.combo<-rbind(precision.10,precision.20,precision.30,precision.40,precision.50)
+
+precision.combo$total.distance<-precision.combo$Repeat*precision.combo$distance
+precision.combo$ratio1=(1/precision.combo$precision)/precision.combo$total.distance
+precision.combo$ratio2=(precision.combo$precision)/precision.combo$total.distance
+
+g2<-ggplot(data = precision.combo,aes(x=Repeat,y=precision,group=TransectLength))
+g2<-g2+geom_line(aes(colour=TransectLength),size=1)+geom_point()
+xmax=20
+ymax=0.4
+g2<-g2+xlab("Number of repeats")+ylab("SE/mean")+xlim(0,xmax)+ylim(0,ymax)
+g2<-g2+geom_ribbon(data=precision.combo,aes(x=Repeat,ymin=low_conf_mean,ymax=high_conf_mean,fill=TransectLength,colour=TransectLength),alpha=0.2)+
+  theme(legend.title=element_text(size=10), legend.text=element_text(size=10),
+                           legend.justification=c(0.25,0.25),legend.key.size =  unit(0.1, "in"),
+                           legend.position=c(0.80, 0.7),
+                           #panel.grid.major = element_blank(),
+                           axis.line = element_line(colour = "black"),
+                           text=element_text(size=8,  family="serif"),
+                           panel.background = element_rect(fill = "white", colour = NA),
+                           panel.grid.major = element_line(colour = "gray"),
+                           panel.grid.minor = element_blank(),
+                           axis.title = element_text(size = rel(1), colour = "black"),
+                           axis.text = element_text(size = rel(1), colour = "black"),
+                           line = element_line(colour = "black", size = 0.25, linetype = 1, lineend = "butt"))+
+          annotate("text", x=xmax/10, y=ymax-ymax/10, label= "(C)" ,size=4,family="serif")
+# g<-g+geom_errorbar(data=precision.combo,aes(x=Repeat,ymin=low_conf_mean,ymax=high_conf_mean,colour=TransectLength),alpha=1)
+C<-g2
+C
+#jpeg("./figures/overleaf/precision_SR_and_H.jpeg",width = 600,height=1000)
+#grid.arrange(g1,g2)
+#dev.off()
+
+a<-ggplot(data=precision.combo,aes(x=Repeat,y=ratio1))+geom_point(aes(color=TransectLength))
+a
+b<-ggplot(data=precision.combo,aes(x=Repeat,y=ratio2))+geom_point(aes(color=TransectLength))
+b
+c<-ggplot(data=precision.combo,aes(x=total.distance,y=precision))+geom_point(aes(color=TransectLength))+geom_line(aes(color=TransectLength))
+xmax=1000
+ymax=0.4
+c<-c+xlim(0,xmax)+ylim(0,ymax)+xlab("Total distance (m)")+ylab("SE/mean")
+c<-c+
+  theme(legend.title=element_text(size=10), legend.text=element_text(size=10),
+                           legend.justification=c(0.25,0.25),legend.key.size =  unit(0.1, "in"),
+                           legend.position=c(0.80, 0.7),
+                           #panel.grid.major = element_blank(),
+                           axis.line = element_line(colour = "black"),
+                           text=element_text(size=8,  family="serif"),
+                           panel.background = element_rect(fill = "white", colour = NA),
+                           panel.grid.major = element_line(colour = "gray"),
+                           panel.grid.minor = element_blank(),
+                           axis.title = element_text(size = rel(1), colour = "black"),
+                           axis.text = element_text(size = rel(1), colour = "black"),
+                           line = element_line(colour = "black", size = 0.25, linetype = 1, lineend = "butt"))+
+          annotate("text", x=xmax/10, y=ymax-ymax/10, label= "(D)" ,size=4,family="serif")
+c<-c+geom_errorbar(data=precision.combo,aes(x=total.distance,ymin=low_conf_mean,ymax=high_conf_mean,fill=TransectLength,colour=TransectLength),alpha=0.6)
+D<-c
+D
+precision.combo$fRepeat<-as.factor(precision.combo$Repeat)
+d<-ggplot(data=precision.combo,aes(x=total.distance,y=precision))+geom_point(aes(color=fRepeat))
+d
+```
+
+```{r warning=FALSE}
+#Determine precision for different distances: amarillosnapper
+precision.10<-average_precision_per_repeat(combinations.10.amarillosnapper)
+precision.20<-average_precision_per_repeat(combinations.20.amarillosnapper)
+precision.30<-average_precision_per_repeat(combinations.30.amarillosnapper)
+precision.40<-average_precision_per_repeat(combinations.40.amarillosnapper)
+precision.50<-average_precision_per_repeat(combinations.50.amarillosnapper)
+precision.10$distance<-10
+precision.20$distance<-20
+precision.30$distance<-30
+precision.40$distance<-40
+precision.50$distance<-50
+precision.10$TransectLength<-"10 meter"
+precision.20$TransectLength<-"20 meter"
+precision.30$TransectLength<-"30 meter"
+precision.40$TransectLength<-"40 meter"
+precision.50$TransectLength<-"50 meter"
+precision.combo<-rbind(precision.10,precision.20,precision.30,precision.40,precision.50)
+
+precision.combo$total.distance<-precision.combo$Repeat*precision.combo$distance
+precision.combo$ratio1=(1/precision.combo$precision)/precision.combo$total.distance
+precision.combo$ratio2=(precision.combo$precision)/precision.combo$total.distance
+
+g2<-ggplot(data = precision.combo,aes(x=Repeat,y=precision,group=TransectLength))
+g2<-g2+geom_line(aes(colour=TransectLength),size=1)+geom_point()
+xmax=20
+ymax=0.8
+g2<-g2+xlab("Number of repeats")+ylab("SE/mean")+xlim(0,xmax)+ylim(0,ymax)
+g2<-g2+geom_ribbon(data=precision.combo,aes(x=Repeat,ymin=low_conf_mean,ymax=high_conf_mean,fill=TransectLength,colour=TransectLength),alpha=0.2)+
+  theme(legend.title=element_text(size=20), legend.text=element_text(size=10),
+                           legend.justification=c(0.5,0.5),legend.key.size =  unit(0.1, "in"),
+                           legend.position=c(0.80, 0.7),
+                           #panel.grid.major = element_blank(),
+                           axis.line = element_line(colour = "black"),
+                           text=element_text(size=16,  family="serif"),
+                           panel.background = element_rect(fill = "white", colour = NA),
+                           panel.grid.major = element_line(colour = "gray"),
+                           panel.grid.minor = element_blank(),
+                           axis.title = element_text(size = rel(1), colour = "black"),
+                           axis.text = element_text(size = rel(1), colour = "black"),
+                           line = element_line(colour = "black", size = 0.5, linetype = 1, lineend = "butt"))+
+          annotate("text", x=xmax/10, y=ymax-ymax/10, label= "(A)" ,size=8,family="serif")
+# g<-g+geom_errorbar(data=precision.combo,aes(x=Repeat,ymin=low_conf_mean,ymax=high_conf_mean,colour=TransectLength),alpha=1)
+PAN1<-g2
+PAN1
+#jpeg("./figures/overleaf/precision_SR_and_H.jpeg",width = 600,height=1000)
+#grid.arrange(g1,g2)
+#dev.off()
+
+a<-ggplot(data=precision.combo,aes(x=Repeat,y=ratio1))+geom_point(aes(color=TransectLength))
+a
+b<-ggplot(data=precision.combo,aes(x=Repeat,y=ratio2))+geom_point(aes(color=TransectLength))
+b
+c<-ggplot(data=precision.combo,aes(x=total.distance,y=precision))+geom_point(aes(color=TransectLength))+geom_line(aes(color=TransectLength))
+xmax=1000
+ymax=0.8
+c<-c+xlim(0,xmax)+ylim(0,ymax)+xlab("Total distance (m)")+ylab("SE/mean")
+c<-c+theme(legend.title=element_text(size=20), legend.text=element_text(size=10),
+                           legend.justification=c(0.5,0.5),legend.key.size =  unit(0.1, "in"),
+                           legend.position=c(0.80, 0.7),
+                           #panel.grid.major = element_blank(),
+                           axis.line = element_line(colour = "black"),
+                           text=element_text(size=16,  family="serif"),
+                           panel.background = element_rect(fill = "white", colour = NA),
+                           panel.grid.major = element_line(colour = "gray"),
+                           panel.grid.minor = element_blank(),
+                           axis.title = element_text(size = rel(1), colour = "black"),
+                           axis.text = element_text(size = rel(1), colour = "black"),
+                           line = element_line(colour = "black", size = 0.5, linetype = 1, lineend = "butt"))+
+          annotate("text", x=xmax/10, y=ymax-ymax/10, label= "(B)" ,size=8,family="serif")
+c<-c+geom_errorbar(data=precision.combo,aes(x=total.distance,ymin=low_conf_mean,ymax=high_conf_mean,fill=TransectLength,colour=TransectLength),alpha=0.6)
+PAN2<-c
+PAN2
+precision.combo$fRepeat<-as.factor(precision.combo$Repeat)
+d<-ggplot(data=precision.combo,aes(x=total.distance,y=precision))+geom_point(aes(color=fRepeat))
+d
+
+```
+
+```{r warning=FALSE}
+#Determine precision for different distances: all species
+for (i in 1:length(specieslist)){
+  directory=paste("./combinations/",specieslist[i],sep="")
+  filename10=paste(directory,"/combinations.loop.10.csv",sep="")
+  combinations.10=read.csv(filename10,stringsAsFactors = FALSE)
+  precision.10<-average_precision_per_repeat(combinations.10)
+  filename20=paste(directory,"/combinations.loop.20.csv",sep="")
+  combinations.20=read.csv(filename20,stringsAsFactors = FALSE)
+  precision.20<-average_precision_per_repeat(combinations.20)
+  filename30=paste(directory,"/combinations.loop.30.csv",sep="")
+  combinations.30=read.csv(filename30,stringsAsFactors = FALSE)
+  precision.30<-average_precision_per_repeat(combinations.30)
+  filename40=paste(directory,"/combinations.loop.40.csv",sep="")
+  combinations.40=read.csv(filename40,stringsAsFactors = FALSE)
+  precision.40<-average_precision_per_repeat(combinations.40)
+  filename50=paste(directory,"/combinations.loop.50.csv",sep="")
+  combinations.50=read.csv(filename50,stringsAsFactors = FALSE)
+  precision.50<-average_precision_per_repeat(combinations.50)
+  precision.10$distance<-10
+  precision.20$distance<-20
+  precision.30$distance<-30
+  precision.40$distance<-40
+  precision.50$distance<-50
+  precision.10$TransectLength<-"10 meter"
+  precision.20$TransectLength<-"20 meter"
+  precision.30$TransectLength<-"30 meter"
+  precision.40$TransectLength<-"40 meter"
+  precision.50$TransectLength<-"50 meter"
+  precision.combo<-rbind(precision.10,precision.20,precision.30,precision.40,precision.50)
+  
+  precision.combo$total.distance<-precision.combo$Repeat*precision.combo$distance
+  precision.combo$ratio1=(1/precision.combo$precision)/precision.combo$total.distance
+  precision.combo$ratio2=(precision.combo$precision)/precision.combo$total.distance
+  
+  g2<-ggplot(data = precision.combo,aes(x=Repeat,y=precision,group=TransectLength))
+  g2<-g2+geom_line(aes(colour=TransectLength),size=1)+geom_point()
+  xmax=20
+  ymax=1.2
+  g2<-g2+xlab("Number of repeats")+ylab("SE/mean")+xlim(0,xmax)+ylim(0,ymax)+ggtitle(specieslist[i])
+  g2<-g2+geom_ribbon(data=precision.combo,aes(x=Repeat,ymin=low_conf_mean,ymax=high_conf_mean,fill=TransectLength,colour=TransectLength),alpha=0.2)+theme(legend.title=element_text(size=20), legend.text=element_text(size=20),
+                             legend.justification=c(0.5,0.5),legend.key.size =  unit(0.2, "in"),
+                             legend.position=c(0.80, 0.7),
+                             #panel.grid.major = element_blank(),
+                             axis.line = element_line(colour = "black"),
+                             text=element_text(size=16,  family="serif"),
+                             panel.background = element_rect(fill = "white", colour = NA),
+                             panel.grid.major = element_line(colour = "gray"),
+                             panel.grid.minor = element_blank(),
+                             axis.title = element_text(size = rel(1), colour = "black"),
+                             axis.text = element_text(size = rel(1), colour = "black"),
+                             line = element_line(colour = "black", size = 0.5, linetype = 1, lineend = "butt"))+
+            annotate("text", x=xmax/10, y=ymax-ymax/10, label= "(G)" ,size=8,family="serif")
+  # g<-g+geom_errorbar(data=precision.combo,aes(x=Repeat,ymin=low_conf_mean,ymax=high_conf_mean,colour=TransectLength),alpha=1)
+  PANFANG1<-g2
+  print(PANFANG1)
+  #jpeg("./figures/overleaf/precision_SR_and_H.jpeg",width = 600,height=1000)
+  #grid.arrange(g1,g2)
+  #dev.off()
+  
+  a<-ggplot(data=precision.combo,aes(x=Repeat,y=ratio1))+geom_point(aes(color=TransectLength))
+  a
+  b<-ggplot(data=precision.combo,aes(x=Repeat,y=ratio2))+geom_point(aes(color=TransectLength))
+  b
+  c<-ggplot(data=precision.combo,aes(x=total.distance,y=precision))+geom_point(aes(color=TransectLength))+geom_line(aes(color=TransectLength))
+  xmax=1000
+  ymax=1.2
+  c<-c+xlim(0,xmax)+ylim(0,ymax)+xlab("Total distance (m)")+ylab("SE/mean")+ggtitle(specieslist[i])
+  c<-c+theme(legend.title=element_text(size=20), legend.text=element_text(size=20),
+                             legend.justification=c(0.5,0.5),legend.key.size =  unit(0.2, "in"),
+                             legend.position=c(0.80, 0.7),
+                             #panel.grid.major = element_blank(),
+                             axis.line = element_line(colour = "black"),
+                             text=element_text(size=16,  family="serif"),
+                             panel.background = element_rect(fill = "white", colour = NA),
+                             panel.grid.major = element_line(colour = "gray"),
+                             panel.grid.minor = element_blank(),
+                             axis.title = element_text(size = rel(1), colour = "black"),
+                             axis.text = element_text(size = rel(1), colour = "black"),
+                             line = element_line(colour = "black", size = 0.5, linetype = 1, lineend = "butt"))+
+            annotate("text", x=xmax/10, y=ymax-ymax/10, label= "(H)" ,size=8,family="serif")
+  c<-c+geom_errorbar(data=precision.combo,aes(x=total.distance,ymin=low_conf_mean,ymax=high_conf_mean,fill=TransectLength,colour=TransectLength),alpha=0.6)
+  PANFANG2<-c
+  print(PANFANG2)
+  precision.combo$fRepeat<-as.factor(precision.combo$Repeat)
+  d<-ggplot(data=precision.combo,aes(x=total.distance,y=precision))+geom_point(aes(color=fRepeat))
+  d
+}
+```
+
+```{r}
+data=combinations.50.SR
+data$Loc_Transect=paste(data$Location,data$Transect)
+data$low_conf_mean<-data$precision_average-qt(0.975,df=data$Repeat-1)*data$precision_sd/sqrt(data$Repeat)
+data$high_conf_mean<-data$precision_average+qt(0.975,df=data$Repeat-1)*data$precision_sd/sqrt(data$Repeat)
+g<-ggplot(data = data,aes(x=Repeat,y=precision_average,group=Loc_Transect))
+g<-g+geom_point(aes(colour=Loc_Transect),size=2)
+g<-g+xlab("Number of repeats")+ylab("SE/mean")+xlim(0,18)+ylim(0,0.30)
+g
+```
+
+```{r}
+#Pooled sub-samples into replicates
+#Adapted from Anderson, 2015 (Measures of precision for dissimilarity-based multivariate analysis of ecological communities)
+#Histogram function 
+
+myhist = function(d,breaks) {
+  n.nan = sum(is.nan(d))
+  my.breaks = (0:breaks)/breaks
+  v=hist(d, breaks = my.breaks,xlim=c(-0.1,1),las=1,
+        main = "", xlab = "", ylab = "")
+  print(v)
+  points(-0.075,n.nan,pch = 19,cex = 1)
+  text(-0.075,0.0,"NaN",pos = 3)
+  return(v$counts)
+}
+mydens = function(d) {
+  plot(density(d,from=-0.1,to=1))
+}
+mypool = function(Y,ipool) {
+  #Y: dissimilarity matrix
+  #ipool: number of observations to take together
+  N = dim(Y)[1]
+  ngroup = floor(N/ipool)
+  group = factor(rep(1:ngroup, each = ipool) )
+  subset = Y[1:length(group),]
+  pooled = rowsum(subset, group)
+  D.pooled = round(vegdist(pooled, measure = "bray"),9)
+  return(D.pooled)
+}
+mypool.max = function(Y,ipool) {
+  #Takes together subsequantial samples (structure of the data is important)
+  N = dim(Y)[1]
+  ngroup = floor(N/ipool)
+  group = factor(rep(1:ngroup, each = ipool) )
+  subset = Y[1:length(group),]
+  subset$group<-group
+  pooled<-subset %>%
+    dplyr::group_by(group) %>%
+    dplyr::summarize_all(max)
+  pooled$group<-NULL
+  D.pooled = round(vegdist(pooled, measure = "bray"),9)
+  return(D.pooled)
+}
+mypool.max.random = function(Y,ipool) {
+  #Takes together random samples (structure of the data is not important)
+  N = dim(Y)[1]
+  ngroup = floor(N/ipool)
+  group = factor(rep(1:ngroup, each = ipool) )
+  group = group[shuffle(group)]
+  subset = Y[1:length(group),]
+  subset$group<-group
+  pooled<-subset %>%
+    dplyr::group_by(group) %>%
+    dplyr::summarize_all(max)
+  pooled$group<-NULL
+  D.pooled = round(vegdist(pooled, measure = "bray"),9)
+  return(D.pooled)
+}
+Pooled.samples<-function(data.repeat,group,breaks,order){
+  runloop=unique(data.repeat[,group])
+  SCA <- expand.grid(splitted=lapply(runloop,as.character)[[1]],number_pooled=c(1:6),stringsAsFactors = FALSE)
+  empty.df <- as.data.frame(matrix(ncol=breaks,nrow=nrow(SCA))) #Create empty dataframe to store dissimilarity values
+  empty.df$splitted=SCA$splitted 
+  empty.df$number_pooled=SCA$number_pooled
+  for (i in 1:nrow(runloop)){ #Run through all the different locations!!!!!!!!!!!!!!!!!!! We only look at the dissimilary values within one location! So we have 10 samples!
+    BC=data.repeat[which(data.repeat[,group]==as.character(runloop[i,1])),] #Take the data of location i
+    BC.fish<-Transformation_data(BC,"4 root") #Take the fish data and transform it
+    D.BC = vegdist(BC.fish, measure = "bray") #Determine the dissimilarity values (each subsample = replicate)
+    
+    for (ipool in 1:6){
+      
+      par(mfrow = c(1,1), mar = c(3, 3, 1, 1))
+      
+      # n = 1 (original)
+      if (ipool==1){ # each subsample = replicate
+        D.1 = D.BC
+        x=t(myhist(D.1,breaks))
+        text(-0.075, 0.8*2000, "n = 1", pos = 4, cex = 1.3)
+      }
+      else{
+        if (order=="strict"){
+          D = mypool.max(BC.fish,ipool) #each ipool number of subsamples = replicate
+          x=t(myhist(D,breaks))
+          text(-0.075, 0.8*500, "n = 2", pos = 4, cex = 1.3)
+        }
+        if (order=="random"){
+          D = mypool.max.random(BC.fish,ipool) #each ipool number of subsamples = replicate
+          x=t(myhist(D,breaks))
+          text(-0.075, 0.8*500, "n = 2", pos = 4, cex = 1.3)
+        }
+      }
+      empty.df[which(empty.df$number_pooled==ipool & empty.df$splitted==as.character(runloop[i,1])),1:ncol(x)]=x #store dissimilarity values
+    }
+  }
+  return(empty.df)
+}
+#Order of repeats is important when pooling repeats
+Pooled.analysis.strict.order<-function(){
+  Pooled.analysis<-Pooled.samples(data.repeat.10,"Code_Transect",10,"strict")
+  Pooled.analysis_original<-Pooled.analysis
+  Pooled.analysis_original=Pooled.analysis_original[order(Pooled.analysis_original$splitted),]
+  
+  Pooled.analysis$splitted<-NULL
+  
+  Pooled.analysis.repeats<-Pooled.analysis %>%
+    dplyr::group_by(number_pooled) %>%
+    dplyr::summarize_all(mean)
+  summ<-apply(Pooled.analysis.repeats[-c(1)],1,sum)
+  for (i in 1:nrow(Pooled.analysis.repeats)){
+    Pooled.analysis.repeats[i,c(2:ncol(Pooled.analysis.repeats))]=Pooled.analysis.repeats[i,c(2:ncol(Pooled.analysis.repeats))]/summ[i]
+  }
+  Pooled.analysis.repeats<-as.data.frame(Pooled.analysis.repeats)
+  Pooled.analysis.repeats=melt(data=Pooled.analysis.repeats,id="number_pooled")
+  #Pooled.analysis.repeats=Pooled.analysis.repeats[which(Pooled.analysis.repeats$number_pooled==1 | Pooled.analysis.repeats$number_pooled==2 | Pooled.analysis.repeats$number_pooled==3),]
+  g<-ggplot(data=Pooled.analysis.repeats,aes(x=variable,y=value,group=number_pooled))
+  g<-g+geom_line(aes(colour=number_pooled),size=2)+scale_colour_gradient(low="coral", high="steelblue")
+  g
+  for (i in 1:6){
+    h<-ggplot(data=Pooled.analysis.repeats[which(Pooled.analysis.repeats$number_pooled==i),],aes(x=variable,y=value))
+    h<-h+geom_bar(stat="identity")+coord_cartesian(ylim = c(0, 0.4))
+    print(h)
+  }
+}
+#Order of repeats is not important when pooling repeats
+Pooled.analysis.random.order<-function(data,group,order){
+  Pooled.analysis<-list()
+  Pooled.analysis.repeats<-list()
+  Pooled.analysis.repeats.sd<-list()
+  for (repeats in 1:10){ #number of times the Pooled.samples function is run (at the end the average is taken)
+    Pooled.analysis[[repeats]]<-Pooled.samples(data,group,breaks=10,order)
+    Pooled.analysis[[repeats]]$splitted<-NULL
+    
+    Pooled.analysis.repeats[[repeats]]<-Pooled.analysis[[repeats]] %>% #there are 60 observations (10 locations and 6 ways to take subsamples together (number_pooled))
+      dplyr::group_by(number_pooled) %>% #pooling over location return one value per number_pooled
+      dplyr::summarize_all(mean)
+    Pooled.analysis.repeats.sd[[repeats]]<-Pooled.analysis[[repeats]] %>%
+      dplyr::group_by(number_pooled) %>%
+      dplyr::summarize_all(sd)
+    summ<-apply(Pooled.analysis.repeats[[repeats]][-c(1)],1,sum) #total amount of dissimilarity values for a specific number_pooled
+    summ.sd<-apply(Pooled.analysis.repeats.sd[[repeats]][-c(1)],1,sum)
+    for (i in 1:nrow(Pooled.analysis.repeats[[repeats]])){
+      Pooled.analysis.repeats[[repeats]][i,c(2:ncol(Pooled.analysis.repeats[[repeats]]))]=Pooled.analysis.repeats[[repeats]][i,c(2:ncol(Pooled.analysis.repeats[[repeats]]))]/summ[i] #Turn amount into percentage
+    }
+    for (i in 1:nrow(Pooled.analysis.repeats.sd[[repeats]])){
+      Pooled.analysis.repeats.sd[[repeats]][i,c(2:ncol(Pooled.analysis.repeats.sd[[repeats]]))]=Pooled.analysis.repeats.sd[[repeats]][i,c(2:ncol(Pooled.analysis.repeats.sd[[repeats]]))]/(summ[i])
+    }
+    Pooled.analysis.repeats[[repeats]]=as.matrix(Pooled.analysis.repeats[[repeats]]) #from list to matrix
+    Pooled.analysis.repeats.sd[[repeats]]=as.matrix(Pooled.analysis.repeats.sd[[repeats]])
+  }
+  Pooled.analysis.repeats=mean.list(Pooled.analysis.repeats) #mean over the number of times the Pooled.samples function is run (repeats in for loop)
+  k=length(Pooled.analysis.repeats.sd)
+  for (i in 1:k){
+    Pooled.analysis.repeats.sd[[i]][,2:ncol(Pooled.analysis.repeats.sd[[i]])]<-Pooled.analysis.repeats.sd[[i]][,2:ncol(Pooled.analysis.repeats.sd[[i]])]^2
+  }
+  Pooled.analysis.repeats.sd=sqrt(Reduce("+",Pooled.analysis.repeats.sd)/k)
+  Pooled.analysis.repeats.sd<-as.data.frame(Pooled.analysis.repeats.sd)
+  Pooled.analysis.repeats.sd$number_pooled=1:nrow(Pooled.analysis.repeats.sd)
+  Pooled.analysis.repeats<-as.data.frame(Pooled.analysis.repeats)
+  Pooled.analysis.repeats=melt(data=Pooled.analysis.repeats,id="number_pooled")
+  Pooled.analysis.repeats.sd=melt(data=Pooled.analysis.repeats.sd,id="number_pooled")
+  Pooled.analysis.repeats$sd<-Pooled.analysis.repeats.sd$value
+  Pooled.analysis.repeats$low_conf_mean<-NA
+  Pooled.analysis.repeats$high_conf_mean<-NA
+  vector=(0:length(unique(Pooled.analysis.repeats$variable)))/length(unique(Pooled.analysis.repeats$variable))
+  v=list()
+  for (i in 1:length(unique(Pooled.analysis.repeats$variable))){
+    v[[i]]=paste(as.character(vector[i]),as.character(vector[i+1]),sep="-")
+  }
+  v=setNames(v,unique(Pooled.analysis.repeats$variable))
+  Pooled.analysis.repeats$variable=as.character(Pooled.analysis.repeats$variable)
+  for (i in 1:length(names(v))){
+    Pooled.analysis.repeats$variable[which(Pooled.analysis.repeats$variable==(names(v)[i]))]=(v[[i]])
+  }
+  g<-ggplot(data=Pooled.analysis.repeats,aes(x=variable,y=value,group=number_pooled))
+  g<-g+geom_line(aes(colour=number_pooled),size=2)+scale_colour_gradient(low="coral", high="steelblue")
+  print(g)
+  for (i in 1:6){
+    h<-ggplot(data=Pooled.analysis.repeats[which(Pooled.analysis.repeats$number_pooled==i),],aes(x=variable,y=value))
+    h<-h+geom_bar(stat="identity")+coord_cartesian(ylim = c(0, 0.4))
+    print(h)
+  }
+  Pooled.analysis.repeats$number_pooled=as.factor(Pooled.analysis.repeats$number_pooled)
+  h<-ggplot(data=Pooled.analysis.repeats,aes(x=variable,y=value,fill=number_pooled))
+  h<-h+geom_bar(stat="identity",position=position_dodge())+coord_cartesian(ylim = c(0, 0.4))+scale_fill_manual("legend", values = c("1" = "black", "2" = "#003300", "3" = "#006600", "4" = "#33CC33","5" = "#66FF33","6" = "#CCFF66"))
+  print(h)
+  Pooled.analysis.repeats$number_pooled=as.numeric(Pooled.analysis.repeats$number_pooled)
+  return(Pooled.analysis.repeats)
+}
+#Create plots for pooled repeats
+plot.Pooled.analysis<-function(Pooled.analysis.repeats,tit){
+  g<-ggplot(data=Pooled.analysis.repeats,aes(x=variable,y=value,group=number_pooled))
+  g<-g+geom_line(aes(colour=number_pooled),size=2)+scale_colour_gradient(low="coral", high="steelblue")
+  print(g)
+  Pooled.analysis.repeats$number_pooled=as.factor(Pooled.analysis.repeats$number_pooled)
+  h<-ggplot(data=Pooled.analysis.repeats,aes(x=variable,y=value,fill=number_pooled))
+  h<-h+geom_bar(stat="identity",position=position_dodge())+coord_cartesian(ylim = c(0, 0.4))+scale_fill_manual("observations\n pooled", values = c("1" = "black", "2" = "#003300", "3" = "#006600", "4" = "#33CC33","5" = "#66FF33","6" = "#CCFF66"))+ylab("percentage")+xlab("dissimilarity values")+
+    theme(
+                           #legend.position="centre",
+                           legend.title=element_text(size=10), legend.text=element_text(size=10),
+                           legend.justification=c(0.5,0.5),legend.key.size =  unit(0.1, "in"),
+                           legend.position=c(0.80, 0.7),
+                           #panel.grid.major = element_blank(),
+                           axis.line = element_line(colour = "black"),
+                           text=element_text(size=16,  family="serif"),
+                           panel.background = element_rect(fill = "white", colour = NA),
+                           panel.grid.major = element_line(colour = "gray"),
+                           panel.grid.minor = element_blank(),
+                           axis.title = element_text(size = 9, colour = "black"),
+                           axis.text = element_text(size = 7, colour = "black"),
+                           axis.text.x = element_text(angle = 45,hjust = 1),
+                           line = element_line(colour = "black", size = 0.5, linetype = 1, lineend = "butt"))+
+    annotate("text", x=7, y=0.35, label= tit ,size=3,family="serif")
+  print(h)
+  return(h)
+}
+
+#Grouping based on location, order of repeats is not important
+Pooled.analysis.random.order.10.Location<-Pooled.analysis.random.order(data.repeat.10,"Location","random")
+Pooled.analysis.random.order.20.Location<-Pooled.analysis.random.order(data.repeat.20,"Location","random")
+Pooled.analysis.random.order.30.Location<-Pooled.analysis.random.order(data.repeat.30,"Location","random")
+Pooled.analysis.random.order.40.Location<-Pooled.analysis.random.order(data.repeat.40,"Location","random")
+Pooled.analysis.random.order.50.Location<-Pooled.analysis.random.order(data.repeat.50,"Location","random")
+
+a1<-plot.Pooled.analysis(Pooled.analysis.random.order.10.Location,"Transect length: 10 m \n Pooled within Location")
+a2<-plot.Pooled.analysis(Pooled.analysis.random.order.20.Location,"Transect length: 20 m \n Pooled within Location")
+a3<-plot.Pooled.analysis(Pooled.analysis.random.order.30.Location,"Transect length: 30 m \n Pooled within Location")
+a4<-plot.Pooled.analysis(Pooled.analysis.random.order.40.Location,"Transect length: 40 m \n Pooled within Location")
+a5<-plot.Pooled.analysis(Pooled.analysis.random.order.50.Location,"Transect length: 50 m \n Pooled within Location")
+grid.arrange(a1,a2,a3,a4,a5)
+
+#Grouping based on transect, order of repeats is not important
+Pooled.analysis.random.order.10.Transect<-Pooled.analysis.random.order(data.repeat.10,"Code_Transect","random")
+Pooled.analysis.random.order.20.Transect<-Pooled.analysis.random.order(data.repeat.20,"Code_Transect","random")
+Pooled.analysis.random.order.30.Transect<-Pooled.analysis.random.order(data.repeat.30,"Code_Transect","random")
+Pooled.analysis.random.order.40.Transect<-Pooled.analysis.random.order(data.repeat.40,"Code_Transect","random")
+Pooled.analysis.random.order.50.Transect<-Pooled.analysis.random.order(data.repeat.50,"Code_Transect","random")
+
+b1<-plot.Pooled.analysis(Pooled.analysis.random.order.10.Transect,"Transect length: 10 m \n Pooled within Transect")
+b2<-plot.Pooled.analysis(Pooled.analysis.random.order.20.Transect,"Transect length: 20 m \n Pooled within Transect")
+b3<-plot.Pooled.analysis(Pooled.analysis.random.order.30.Transect,"Transect length: 30 m \n Pooled within Transect")
+b4<-plot.Pooled.analysis(Pooled.analysis.random.order.40.Transect,"Transect length: 40 m \n Pooled within Transect")
+b5<-plot.Pooled.analysis(Pooled.analysis.random.order.50.Transect,"Transect length: 50 m \n Pooled within Transect")
+grid.arrange(b1,b2,b3,b4,b5)
+
+#Grouping based on location, order of repeats is important
+Pooled.analysis.strict.order.10<-Pooled.analysis.random.order(data.repeat.10,"Location","strict")
+Pooled.analysis.strict.order.20<-Pooled.analysis.random.order(data.repeat.20,"Location","strict")
+Pooled.analysis.strict.order.30<-Pooled.analysis.random.order(data.repeat.30,"Location","strict")
+Pooled.analysis.strict.order.40<-Pooled.analysis.random.order(data.repeat.40,"Location","strict")
+Pooled.analysis.strict.order.50<-Pooled.analysis.random.order(data.repeat.50,"Location","strict")
+
+plot.Pooled.analysis(Pooled.analysis.strict.order.10,"")
+plot.Pooled.analysis(Pooled.analysis.strict.order.20,"")
+plot.Pooled.analysis(Pooled.analysis.strict.order.30,"")
+plot.Pooled.analysis(Pooled.analysis.strict.order.40,"")
+plot.Pooled.analysis(Pooled.analysis.strict.order.50,"")
+```
+
+```{r}
+#Adapted from Anderson, 2015 (Measures of precision for dissimilarity-based multivariate analysis of ecological communities)
+#Histogram function 
+#Determine precentage of uninformative dissimilarity values 
+myhist.nan = function(d) {
+  n.nan = sum(is.nan(d))
+  n.0 = length(which(d==0))
+  n.1 = length(which(d==1))
+  n.nan.0.1=c(n.nan,n.0,n.1)
+  return(n.nan.0.1)
+}
+
+mypool.max.random = function(Y,ipool) {
+  #Takes together random samples (structure of the data is not important)
+  N = dim(Y)[1]
+  ngroup = floor(N/ipool)
+  group = factor(rep(1:ngroup, each = ipool) )
+  group = group[shuffle(group)]
+  subset = Y[1:length(group),]
+  subset$group<-group
+  pooled<-subset %>%
+    dplyr::group_by(group) %>%
+    dplyr::summarize_all(max)
+  pooled$group<-NULL
+  D.pooled = round(vegdist(pooled, measure = "bray"),9)
+  return(D.pooled)
+}
+
+Pooled.samples.nan<-function(data.repeat,group,order){
+  runloop=unique(data.repeat[,group])
+  SCA <- expand.grid(splitted=lapply(runloop,as.character)[[1]],number_pooled=c(1:6),stringsAsFactors = FALSE)
+  empty.df <- as.data.frame(matrix(ncol=3,nrow=nrow(SCA))) #Create empty dataframe to store dissimilarity values
+  empty.df$splitted=SCA$splitted 
+  empty.df$number_pooled=SCA$number_pooled
+  for (i in 1:nrow(runloop)){ #Run through all the different locations!!!!!!!!!!!!!!!!!!! We only look at the dissimilary values within one location! So we have 10 samples!
+    BC=data.repeat[which(data.repeat[,group]==as.character(runloop[i,1])),] #Take the data of location i
+    BC.fish<-Transformation_data(BC,"4 root") #Take the fish data and transform it
+    D.BC = vegdist(BC.fish, measure = "bray") #Determine the dissimilarity values (each subsample = replicate)
+    
+    for (ipool in 1:6){
+      
+      par(mfrow = c(1,1), mar = c(3, 3, 1, 1))
+      
+      # n = 1 (original)
+      if (ipool==1){ # each subsample = replicate
+        D.1 = D.BC
+        x=t(myhist.nan(D.1))
+      }
+      else{
+        if (order=="strict"){
+          D = mypool.max(BC.fish,ipool) #each ipool number of subsamples = replicate
+          x=t(myhist.nan(D))
+        }
+        if (order=="random"){
+          D = mypool.max.random(BC.fish,ipool) #each ipool number of subsamples = replicate
+          x=t(myhist.nan(D))
+        }
+      }
+      empty.df[which(empty.df$number_pooled==ipool & empty.df$splitted==as.character(runloop[i,1])),1:ncol(x)]=x #store dissimilarity values
+    }
+  }
+  return(empty.df)
+}
+
+
+Pooled.analysis.random.order.nan<-function(data,group,order){
+  Pooled.analysis<-list()
+  Pooled.analysis.repeats<-list()
+  Pooled.analysis.repeats.sd<-list()
+  for (repeats in 1:100){ #number of times the Pooled.samples function is run (at the end the average is taken)
+    Pooled.analysis[[repeats]]<-Pooled.samples.nan(data,group,order)
+    Pooled.analysis[[repeats]]$splitted<-NULL
+    colnames(Pooled.analysis[[repeats]])=c("NA","0","1","number_pooled")
+    Pooled.analysis.repeats[[repeats]]<-Pooled.analysis[[repeats]] %>% #there are 60 observations (10 locations and 6 ways to take subsamples together (number_pooled))
+      dplyr::group_by(number_pooled) %>% #pooling over location return one value per number_pooled
+      dplyr::summarize_all(mean)
+    Pooled.analysis.repeats.sd[[repeats]]<-Pooled.analysis[[repeats]] %>%
+      dplyr::group_by(number_pooled) %>%
+      dplyr::summarize_all(sd)
+    summ<-c(1431,351,153,78,45,36) #total amount of dissimilarity values for a specific number_pooled
+    for (i in 1:nrow(Pooled.analysis.repeats[[repeats]])){
+      Pooled.analysis.repeats[[repeats]][i,c(2:ncol(Pooled.analysis.repeats[[repeats]]))]=Pooled.analysis.repeats[[repeats]][i,c(2:ncol(Pooled.analysis.repeats[[repeats]]))]/summ[i] #Turn amount into percentage
+    }
+    for (i in 1:nrow(Pooled.analysis.repeats.sd[[repeats]])){
+      Pooled.analysis.repeats.sd[[repeats]][i,c(2:ncol(Pooled.analysis.repeats.sd[[repeats]]))]=Pooled.analysis.repeats.sd[[repeats]][i,c(2:ncol(Pooled.analysis.repeats.sd[[repeats]]))]/(summ[i])
+    }
+    Pooled.analysis.repeats[[repeats]]=as.matrix(Pooled.analysis.repeats[[repeats]]) #from list to matrix
+    Pooled.analysis.repeats.sd[[repeats]]=as.matrix(Pooled.analysis.repeats.sd[[repeats]])
+  }
+  Pooled.analysis.repeats=mean.list(Pooled.analysis.repeats) #mean over the number of times the Pooled.samples function is run (repeats in for loop)
+  k=length(Pooled.analysis.repeats.sd)
+  for (i in 1:k){
+    Pooled.analysis.repeats.sd[[i]][,2:ncol(Pooled.analysis.repeats.sd[[i]])]<-Pooled.analysis.repeats.sd[[i]][,2:ncol(Pooled.analysis.repeats.sd[[i]])]^2
+  }
+  Pooled.analysis.repeats.sd=sqrt(Reduce("+",Pooled.analysis.repeats.sd)/k)
+  Pooled.analysis.repeats.sd<-as.data.frame(Pooled.analysis.repeats.sd)
+  Pooled.analysis.repeats.sd$number_pooled=1:nrow(Pooled.analysis.repeats.sd)
+  Pooled.analysis.repeats<-as.data.frame(Pooled.analysis.repeats)
+  Pooled.analysis.repeats=melt(data=Pooled.analysis.repeats,id="number_pooled")
+  Pooled.analysis.repeats.sd=melt(data=Pooled.analysis.repeats.sd,id="number_pooled")
+  Pooled.analysis.repeats$sd<-Pooled.analysis.repeats.sd$value
+  Pooled.analysis.repeats$low_conf_mean<-qt(0.0975,df=k-1)*Pooled.analysis.repeats$sd/k
+  Pooled.analysis.repeats$high_conf_mean<-qt(0.0975,df=k-1)*Pooled.analysis.repeats$sd/k
+  
+  Pooled.analysis.repeats$sd<-Pooled.analysis.repeats$sd*100
+  Pooled.analysis.repeats$value<-Pooled.analysis.repeats$value*100
+  Pooled.analysis.repeats$low_conf_mean<-Pooled.analysis.repeats$low_conf_mean*100
+  Pooled.analysis.repeats$high_conf_mean<-Pooled.analysis.repeats$high_conf_mean*100
+  
+  Pooled.analysis.repeats[,c("value","sd","low_conf_mean","high_conf_mean")]=round(Pooled.analysis.repeats[,c("value","sd","low_conf_mean","high_conf_mean")],digits = 4)
+
+  return(Pooled.analysis.repeats)
+}
+
+pooled.nan.10.location<-Pooled.analysis.random.order.nan(data=data.repeat.10,"Location","random")
+pooled.nan.20.location<-Pooled.analysis.random.order.nan(data=data.repeat.20,"Location","random")
+pooled.nan.30.location<-Pooled.analysis.random.order.nan(data=data.repeat.30,"Location","random")
+pooled.nan.40.location<-Pooled.analysis.random.order.nan(data=data.repeat.40,"Location","random")
+pooled.nan.50.location<-Pooled.analysis.random.order.nan(data=data.repeat.50,"Location","random")
+
+pooled.nan.10.location$TransectLength<-"10"
+pooled.nan.20.location$TransectLength<-"20"
+pooled.nan.30.location$TransectLength<-"30"
+pooled.nan.40.location$TransectLength<-"40"
+pooled.nan.50.location$TransectLength<-"50"
+pooled.nan.location<-rbind(pooled.nan.10.location,pooled.nan.20.location,pooled.nan.30.location,pooled.nan.40.location,pooled.nan.50.location)
+pooled.nan.location <- dcast(pooled.nan.location, number_pooled + variable ~ TransectLength, value.var="value")
+pooled.nan.location <- pooled.nan.location[order(pooled.nan.location$variable),]
+
+pooled.nan.10.transect<-Pooled.analysis.random.order.nan(data=data.repeat.10,"Code_Transect","random")
+pooled.nan.20.transect<-Pooled.analysis.random.order.nan(data=data.repeat.20,"Code_Transect","random")
+pooled.nan.30.transect<-Pooled.analysis.random.order.nan(data=data.repeat.30,"Code_Transect","random")
+pooled.nan.40.transect<-Pooled.analysis.random.order.nan(data=data.repeat.40,"Code_Transect","random")
+pooled.nan.50.transect<-Pooled.analysis.random.order.nan(data=data.repeat.50,"Code_Transect","random")
+
+pooled.nan.10.transect$TransectLength<-"10"
+pooled.nan.20.transect$TransectLength<-"20"
+pooled.nan.30.transect$TransectLength<-"30"
+pooled.nan.40.transect$TransectLength<-"40"
+pooled.nan.50.transect$TransectLength<-"50"
+pooled.nan.transect<-rbind(pooled.nan.10.transect,pooled.nan.20.transect,pooled.nan.30.transect,pooled.nan.40.transect,pooled.nan.50.transect)
+pooled.nan.transect <- dcast(pooled.nan.transect, number_pooled + variable ~ TransectLength, value.var="value")
+pooled.nan.transect <- pooled.nan.transect[order(pooled.nan.transect$variable),]
+```
+
+```{r}
+#Multivariate precision function
+#Adapted from Anderson, 2015 (Measures of precision for dissimilarity-based multivariate analysis of ecological communities)
+#per transect: complex structure of nested and crossed factors not taken into account. The average per transect is taken.
+MSEgroup.d = function (D, group, nresamp = 10, ...) {
+  
+  # Some necessary preliminary functions:            
+  mult.SE = function (d) {
+    n = dim(as.matrix(d))[1]
+    ss = sum(d^2)/n
+    v = ss/(n-1)
+    x = sqrt(v/n)
+    return(x)
+  }
+  quant.upper = function(x) quantile(x, prob = 0.975, na.rm = TRUE)
+  quant.lower = function(x) quantile(x, prob = 0.025, na.rm = TRUE)
+  
+  # Getting parameters of the problem
+  group = factor(group)
+  ng = length(levels(group))
+  n.i = table(group) 
+  
+  # Ensure distance matrix is in the form of a matrix (rather than a "distance" object)
+  D = as.matrix(D)
+  
+  # Setting up the matrices for results
+  means <- means.b <- lower <- upper <- matrix(rep(0,ng*max(n.i)),ncol = max(n.i), nrow = ng)
+  colnames(means) <- colnames(lower) <- colnames(upper) <- 1:max(n.i)
+  rownames(means) <- rownames(lower) <- rownames(upper) <- levels(group)
+  
+  # Loop - do this for each group
+  for (igroup in 1:ng) {
+    subset.D = D[ group==levels(group)[igroup] , group==levels(group)[igroup] ]
+    
+    # One matrix is used to store the values under permutation resampling for each sample size
+    multSE.store.p = matrix(rep(0,nresamp*n.i[igroup]), ncol = n.i[igroup], nrow = nresamp)
+    # One matrix is used to store the values under bootstrap resampling for each sample size
+    multSE.store.b = matrix(rep(0,nresamp*n.i[igroup]), ncol = n.i[igroup], nrow = nresamp)
+    
+    # Bootstrap loop for each sample size.
+    for (nsub in 2:n.i[igroup]) {
+      for (iresamp in 1:nresamp) {
+        ivec.p = sample(1:n.i[igroup], size = nsub, replace = FALSE)
+        ivec.b = sample(1:n.i[igroup], size = nsub, replace = TRUE)
+        D.perm = subset.D[ivec.p,ivec.p]
+        D.boot = subset.D[ivec.b,ivec.b]
+        multSE.store.p[iresamp,nsub] = mult.SE(as.dist(D.perm))
+        multSE.store.b[iresamp,nsub] = mult.SE(as.dist(D.boot))
+      }
+    }
+    
+    # Means and quantiles
+    means[igroup,1:n.i[igroup]] = colMeans(multSE.store.p)
+    means.b[igroup,1:n.i[igroup]] = colMeans(multSE.store.b)
+    upper[igroup,1:n.i[igroup]] = apply(multSE.store.b,MARGIN = 2,quant.upper)
+    lower[igroup,1:n.i[igroup]] = apply(multSE.store.b,MARGIN = 2,quant.lower)
+    
+  } # end of loop for groups
+  
+  bias =  means - means.b
+  lower = lower + bias
+  upper = upper + bias
+  return(list(means = means, lower = lower, upper = upper))
+  
+}
+```
+
+```{r}
+#Determine multSE
+RUN.MSEgroup.d<-function(data.repeat,grouping){
+  Group = factor(lapply(data.repeat[,grouping],as.character)[[1]])
+  Y = Transformation_data(data.repeat,"4root")
+  D = vegdist(Y, method = "bray")
+  output = MSEgroup.d(D, Group, nresamp = 10)
+  
+  ng = length(levels(Group))
+  n.i = table(Group)
+  nmax = max(n.i) 
+  nudge = 0
+  
+  mycol = c("black","gray54","white")
+  mypch = c(21,24,25)
+  plot(3:nmax, output$means[3:nmax],type="n", main = "",
+       ylab = "Multivariate pseudo SE", xlab = "Sample size (n)",
+       ylim = c(0,0.3), xlim = c(1,22), las=1) 
+  for (i in 1:ng) {
+    arrows(3:n.i[i]+nudge, output$upper[i,3:n.i[i]],
+           3:n.i[i]+nudge, output$lower[i,3:n.i[i]],
+           length = 0.01, angle = 90, code = 3, col = "black")
+    points(3:n.i[i]+nudge, output$means[i,3:n.i[i]], pch = mypch[i], bg = mycol[i])
+    nudge = nudge + 0.20
+  }
+  legend(x = "topright", legend = c(levels(Group)), pch = mypch, pt.bg = mycol)
+  return(output)
+}
+```
+
+```{r}
+#Plot multSE
+Personal_output=function(data,group,distance){
+  output<-RUN.MSEgroup.d(data,group)
+  output[[1]]=colMeans(output[[1]],na.rm = TRUE)
+  output[[2]]=colMeans(output[[2]],na.rm = TRUE)
+  output[[3]]=colMeans(output[[3]],na.rm = TRUE)
+  output<-as.data.frame(do.call(cbind,output))
+  output$distance=distance
+  output$repeats=1:nrow(output)
+  return(output)
+}
+output=Personal_output(data.repeat.10,"Code_Transect","10 meter")
+plot(3:length(output[[1]]), output$means[3:length(output[[1]])], main = "",
+       ylab = "Multivariate pseudo SE", xlab = "Sample size (n)",
+       ylim = c(0,0.3), xlim = c(1,length(output[[1]])), las=1) 
+arrows(3:length(output[[1]]), output$upper[3:length(output[[1]])],
+           3:length(output[[1]]), output$lower[3:length(output[[1]])],
+           length = 0.01, angle = 90, code = 3, col = "black")
+output=Personal_output(data.repeat.10,"Location","10 meter")
+plot(3:length(output[[1]]), output$means[3:length(output[[1]])], main = "",
+       ylab = "Multivariate pseudo SE", xlab = "Sample size (n)",
+       ylim = c(0,0.3), xlim = c(1,length(output[[1]])), las=1) 
+arrows(3:length(output[[1]]), output$upper[3:length(output[[1]])],
+           3:length(output[[1]]), output$lower[3:length(output[[1]])],
+           length = 0.01, angle = 90, code = 3, col = "black")
+output.10=Personal_output(data.repeat.10,"Location","10 meter")
+output.20=Personal_output(data.repeat.20,"Location","20 meter")
+output.30=Personal_output(data.repeat.30,"Location","30 meter")
+output.40=Personal_output(data.repeat.40,"Location","40 meter")
+output.50=Personal_output(data.repeat.50,"Location","50 meter")
+output=rbind(output.10,output.20,output.30,output.40,output.50)
+output=output[-which(output$repeats==1),]
+g<-ggplot(data = output,aes(x=repeats,y=means,group=distance))
+g<-g+geom_point(aes(colour=distance))
+g<-g+geom_errorbar(data=output,aes(x=repeats,ymin=lower,ymax=upper,colour=distance),alpha=0.2)
+g<-g+xlab("Repeats")+ylab("Multivariate pseudo SE")
+g
+```
+
+```{r}
+#Multivariate precision function based on residuals PERMANOVA: takes into account that there are multiple factors
+MSE.d = function (data.repeat.10, group, nresamp = 10, ...) {
+  
+  # Some necessary preliminary functions:            
+  MSE = function(data.repeat.10) {
+    type="adonis"
+    perm.species.amount=Personal_PERMANOVA(data.repeat.10,c('Island','Location','Code_Transect'),'fish.dist','+',type)
+    if (type=="adonis"){
+      perm.species.amount=perm.species.amount$aov.tab
+      MSE=perm.species.amount$SumsOfSqs[length(perm.species.amount$SumsOfSqs)-1]/perm.species.amount$Df[length(perm.species.amount$Df)-1]
+    }
+    if (type=="adonis2"){
+      MSE=perm.species.amount$SumOfSqs[length(perm.species.amount$SumOfSqs)-1]/perm.species.amount$Df[length(perm.species.amount$Df)-1]
+    }
+    return(MSE)
+  }
+  quant.upper = function(x) quantile(x, prob = 0.975, na.rm = TRUE)
+  quant.lower = function(x) quantile(x, prob = 0.025, na.rm = TRUE)
+  
+  # Getting parameters of the problem
+  group = factor(group)
+  ng = length(levels(group))
+  n.i = table(group)
+  nmax = min(n.i)
+  N = sum(n.i)
+  index = 1:N 
+  
+  # Setting up the vectors for the results
+  # Note that these do not have to be separate whole matrices now.
+  means <- means.b <- lower <- upper <- rep(0,nmax)
+  
+  # One matrix is used to store the values under permutation resampling for each sample size
+  multSE.store.p = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  # One matrix is used to store the values under bootstrap resampling for each sample size
+  multSE.store.b = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  
+  # Resampling loop for each sample size.
+  for (nsub in 2:nmax) {
+    for (iresamp in 1:nresamp) {
+      ivec.p = sample(index[group==levels(group)[1]], size = nsub, replace = FALSE)
+      ivec.b = sample(index[group==levels(group)[1]], size = nsub, replace = TRUE)
+      for (i in 2:ng) {
+        ivec.p = c(ivec.p,sample(index[group==levels(group)[i]], size = nsub, replace = FALSE))
+        ivec.b = c(ivec.b,sample(index[group==levels(group)[i]], size = nsub, replace = TRUE))
+      }
+      group.resamp = factor(rep(1:ng, each = nsub))
+      # D.perm = D[ivec.p,ivec.p]
+      # D.boot = D[ivec.b,ivec.b]
+      multSE.store.p[iresamp,nsub] = sqrt(MSE(data.repeat.10[ivec.p,])/nsub) 
+      multSE.store.b[iresamp,nsub] = sqrt(MSE(data.repeat.10[ivec.b,])/nsub)
+    }
+  }
+  
+  # Means and quantiles
+  means = colMeans(multSE.store.p)
+  means.b = colMeans(multSE.store.b)
+  upper = apply(multSE.store.b,MARGIN = 2,quant.upper)
+  lower = apply(multSE.store.b,MARGIN = 2,quant.lower)
+  
+  # Calculation of bias and completion of output
+  bias =  means - means.b
+  lower = lower + bias
+  upper = upper + bias
+  output = cbind(1:nmax, means, lower, upper)
+  colnames(output) <- c("n","mean", "lower.025", "upper.975")
+  return(as.data.frame(output))
+  
+} # end of MSE.d function
+
+R2.d = function (data.repeat.10, group, nresamp = 10, ...) {
+  
+  # Some necessary preliminary functions:            
+  MSE = function(data.repeat.10) {
+    type="adonis"
+    perm.species.amount=Personal_PERMANOVA(data.repeat.10,c('Island','Location','Code_Transect'),'fish.dist','+',type)
+    if (type=="adonis"){
+      perm.species.amount=perm.species.amount$aov.tab
+      # R=perm.species.amount$R2
+      # pseudoF=perm.species.amount$F.Model
+      # MeanSqs=perm.species.amount$MeanSqs
+      # Pr=perm.species.amount$`Pr(>F)`
+    }
+    if (type=="adonis2"){
+      MSE=perm.species.amount$SumOfSqs[length(perm.species.amount$SumOfSqs)-1]/perm.species.amount$Df[length(perm.species.amount$Df)-1]
+    }
+    return(perm.species.amount)
+  }
+  quant.upper = function(x) quantile(x, prob = 0.975, na.rm = TRUE)
+  quant.lower = function(x) quantile(x, prob = 0.025, na.rm = TRUE)
+  
+  # Getting parameters of the problem
+  group = factor(group)
+  ng = length(levels(group))
+  n.i = table(group)
+  nmax = min(n.i)
+  N = sum(n.i)
+  index = 1:N 
+  
+  # Setting up the vectors for the results
+  # Note that these do not have to be separate whole matrices now.
+  means <- means.b <- lower <- upper <- rep(0,nmax)
+  
+  # One matrix is used to store the values under permutation resampling for each sample size
+  R2.store.p.island = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  R2.store.p.location = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  R2.store.p.transect = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  pseudoF.store.p.island = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  pseudoF.store.p.location = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  pseudoF.store.p.transect = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  MeanSqs.store.p.island = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  MeanSqs.store.p.location = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  MeanSqs.store.p.transect = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  Pr.store.p.island = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  Pr.store.p.location = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  Pr.store.p.transect = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  MultSA.store.p.island = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  MultSA.store.p.location = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  MultSA.store.p.transect = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  # One matrix is used to store the values under bootstrap resampling for each sample size
+  R2.store.b.island = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  R2.store.b.location = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  R2.store.b.transect = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  pseudoF.store.b.island = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  pseudoF.store.b.location = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  pseudoF.store.b.transect = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  MeanSqs.store.b.island = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  MeanSqs.store.b.location = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  MeanSqs.store.b.transect = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  Pr.store.b.island = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  Pr.store.b.location = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  Pr.store.b.transect = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  MultSA.store.b.island = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  MultSA.store.b.location = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  MultSA.store.b.transect = matrix(rep(0,nresamp*nmax), ncol = nmax, nrow = nresamp)
+  
+  # Resampling loop for each sample size.
+  for (nsub in 2:nmax) {
+    for (iresamp in 1:nresamp) {
+      ivec.p = sample(index[group==levels(group)[1]], size = nsub, replace = FALSE)
+      ivec.b = sample(index[group==levels(group)[1]], size = nsub, replace = TRUE)
+      for (i in 2:ng) {
+        ivec.p = c(ivec.p,sample(index[group==levels(group)[i]], size = nsub, replace = FALSE))
+        ivec.b = c(ivec.b,sample(index[group==levels(group)[i]], size = nsub, replace = TRUE))
+      }
+      group.resamp = factor(rep(1:ng, each = nsub))
+      perm.species.amount.p=MSE(data.repeat.10[ivec.p,])
+      perm.species.amount.b=MSE(data.repeat.10[ivec.b,])
+      R2.p=perm.species.amount.p$R2
+      R2.b=perm.species.amount.b$R2
+      R2.store.p.island[iresamp,nsub] = R2.p[1]
+      R2.store.b.island[iresamp,nsub] = R2.b[1]
+      R2.store.p.location[iresamp,nsub] = R2.p[2]
+      R2.store.b.location[iresamp,nsub] = R2.b[2]
+      R2.store.p.transect[iresamp,nsub] = R2.p[3]
+      R2.store.b.transect[iresamp,nsub] = R2.b[3]
+      F.p=perm.species.amount.p$F.Model
+      F.b=perm.species.amount.b$F.Model
+      pseudoF.store.p.island[iresamp,nsub] = F.p[1]
+      pseudoF.store.b.island[iresamp,nsub] = F.b[1]
+      pseudoF.store.p.location[iresamp,nsub] = F.p[2]
+      pseudoF.store.b.location[iresamp,nsub] = F.b[2]
+      pseudoF.store.p.transect[iresamp,nsub] = F.p[3]
+      pseudoF.store.b.transect[iresamp,nsub] = F.b[3]
+      MeanSqs.p=perm.species.amount.p$MeanSqs
+      MeanSqs.b=perm.species.amount.b$MeanSqs
+      MeanSqs.store.p.island[iresamp,nsub] = MeanSqs.p[1]
+      MeanSqs.store.b.island[iresamp,nsub] = MeanSqs.b[1]
+      MeanSqs.store.p.location[iresamp,nsub] = MeanSqs.p[2]
+      MeanSqs.store.b.location[iresamp,nsub] = MeanSqs.b[2]
+      MeanSqs.store.p.transect[iresamp,nsub] = MeanSqs.p[3]
+      MeanSqs.store.b.transect[iresamp,nsub] = MeanSqs.b[3]
+      Pr.p=perm.species.amount.p$`Pr(>F)`
+      Pr.b=perm.species.amount.b$`Pr(>F)`
+      Pr.store.p.island[iresamp,nsub] = Pr.p[1]
+      Pr.store.b.island[iresamp,nsub] = Pr.b[1]
+      Pr.store.p.location[iresamp,nsub] = Pr.p[2]
+      Pr.store.b.location[iresamp,nsub] = Pr.b[2]
+      Pr.store.p.transect[iresamp,nsub] = Pr.p[3]
+      Pr.store.b.transect[iresamp,nsub] = Pr.b[3]
+      MultSA.store.p.island[iresamp,nsub] = sqrt(MeanSqs.p[1]/nsub) 
+      MultSA.store.b.island[iresamp,nsub] = sqrt(MeanSqs.b[1]/nsub)
+      MultSA.store.p.location[iresamp,nsub] = sqrt(MeanSqs.p[2]/nsub) 
+      MultSA.store.b.location[iresamp,nsub] = sqrt(MeanSqs.b[2]/nsub)
+      MultSA.store.p.transect[iresamp,nsub] = sqrt(MeanSqs.p[3]/nsub) 
+      MultSA.store.b.transect[iresamp,nsub] = sqrt(MeanSqs.b[3]/nsub)
+    }
+  }
+  
+  # Means and quantiles
+  
+  processing.repetitions.perm<-function(R2.store.p.island,
+                                        R2.store.b.island,
+                                        R2.store.p.location,
+                                        R2.store.b.location,
+                                        R2.store.p.transect,
+                                        R2.store.b.transect,name){
+    R2.means.island = colMeans(R2.store.p.island)
+    R2.means.b.island = colMeans(R2.store.b.island)
+    R2.upper.island = apply(R2.store.b.island,MARGIN = 2,quant.upper)
+    R2.lower.island = apply(R2.store.b.island,MARGIN = 2,quant.lower)
+    
+    R2.means.location = colMeans(R2.store.p.location)
+    R2.means.b.location = colMeans(R2.store.b.location)
+    R2.upper.location = apply(R2.store.b.location,MARGIN = 2,quant.upper)
+    R2.lower.location = apply(R2.store.b.location,MARGIN = 2,quant.lower)
+    
+    R2.means.transect = colMeans(R2.store.p.transect)
+    R2.means.b.transect = colMeans(R2.store.b.transect)
+    R2.upper.transect = apply(R2.store.b.transect,MARGIN = 2,quant.upper)
+    R2.lower.transect = apply(R2.store.b.transect,MARGIN = 2,quant.lower)
+    
+    # Calculation of bias and completion of output
+    R2.bias.island =  R2.means.island - R2.means.b.island
+    R2.lower.island = R2.lower.island + R2.bias.island
+    R2.upper.island = R2.upper.island + R2.bias.island
+    R2.output.island = cbind(1:nmax, R2.means.island, R2.lower.island, R2.upper.island)
+    colnames(R2.output.island) <- c("n",paste(name,".mean.island",sep=""), paste(name,".lower.025.island",sep=""), paste(name,".upper.975.island",sep=""))
+    
+    R2.bias.location =  R2.means.location - R2.means.b.location
+    R2.lower.location = R2.lower.location + R2.bias.location
+    R2.upper.location = R2.upper.location + R2.bias.location
+    R2.output.location = cbind(1:nmax, R2.means.location, R2.lower.location, R2.upper.location)
+    colnames(R2.output.location) <- c("n",paste(name,".mean.location",sep=""), paste(name,".lower.025.location",sep=""), paste(name,".upper.975.location",sep=""))
+    
+    R2.bias.transect =  R2.means.transect - R2.means.b.transect
+    R2.lower.transect = R2.lower.transect + R2.bias.transect
+    R2.upper.transect = R2.upper.transect + R2.bias.transect
+    R2.output.transect = cbind(1:nmax, R2.means.transect, R2.lower.transect, R2.upper.transect)
+    colnames(R2.output.transect) <- c("n",paste(name,".mean.transect",sep=""), paste(name,".lower.025.transect",sep=""), paste(name,".upper.975.transect",sep=""))
+  
+    x<-list(R2.output.island,R2.output.location,R2.output.transect)
+    return(x)
+  }
+  
+  u=processing.repetitions.perm(R2.store.p.island,R2.store.b.island,R2.store.p.location,R2.store.b.location,R2.store.p.transect,R2.store.b.transect,name="R2")
+  v=processing.repetitions.perm(pseudoF.store.p.island,pseudoF.store.b.island,pseudoF.store.p.location,pseudoF.store.b.location,pseudoF.store.p.transect,pseudoF.store.b.transect,name="F")
+  w=processing.repetitions.perm(MeanSqs.store.p.island,MeanSqs.store.b.island,MeanSqs.store.p.location,MeanSqs.store.b.location,MeanSqs.store.p.transect,MeanSqs.store.b.transect,name="MeanSqs")
+  x=processing.repetitions.perm(Pr.store.p.island,Pr.store.b.island,Pr.store.p.location,Pr.store.b.location,Pr.store.p.transect,Pr.store.b.transect,name="pvalue")
+  y=processing.repetitions.perm(MultSA.store.p.island,MultSA.store.b.island,MultSA.store.p.location,MultSA.store.b.location,MultSA.store.p.transect,MultSA.store.b.transect,name="multSA")
+  a=c(u,v,w,x,y)
+  
+  return(a)
+  
+} # end of MSE.d function
+
+
+#######################################################################################
+data.repeat.list<-list()
+data.repeat.list[[1]]=data.repeat.10
+data.repeat.list[[2]]=data.repeat.20
+data.repeat.list[[3]]=data.repeat.30
+data.repeat.list[[4]]=data.repeat.40
+data.repeat.list[[5]]=data.repeat.50
+
+output.10.permanova = MSE.d(data.repeat.10, data.repeat.10$Code_Transect, nresamp = 2)
+output.10.permanova= as.data.frame(output.10.permanova)
+output.20.permanova = MSE.d(data.repeat.20, data.repeat.20$Code_Transect, nresamp = 2)
+output.20.permanova= as.data.frame(output.20.permanova)
+output.30.permanova = MSE.d(data.repeat.30, data.repeat.30$Code_Transect, nresamp = 2)
+output.30.permanova= as.data.frame(output.30.permanova)
+output.40.permanova = MSE.d(data.repeat.40, data.repeat.40$Code_Transect, nresamp = 2)
+output.40.permanova= as.data.frame(output.40.permanova)
+output.50.permanova = MSE.d(data.repeat.50, data.repeat.50$Code_Transect, nresamp = 2)
+output.50.permanova= as.data.frame(output.50.permanova)
+
+plot.precision.permanova.single<-function(data.repeat.10,output){
+  ng = length(levels(data.repeat.10$Code_Transect))
+  n.i = table(data.repeat.10$Code_Transect)
+  nmax = max(n.i) 
+  
+  plot(2:nmax, output$mean[2:nmax], type = "n", main = "",
+       ylab = "MultSE based on residual mean square", xlab = "Sample size (n)",
+       ylim = c(0,0.35), xlim = c(1,20), las=1) 
+  arrows(2:nmax, output$upper[2:nmax],
+         2:nmax, output$lower[2:nmax],
+         length = 0.02, angle = 90, code = 3, col = "black")
+  points(2:nmax, output$mean[2:nmax], pch = 21, bg = "black")
+}
+plot.precision.permanova.single(data.repeat.10,output.10.permanova)
+plot.precision.permanova.single(data.repeat.20,output.20.permanova)
+plot.precision.permanova.single(data.repeat.30,output.30.permanova)
+plot.precision.permanova.single(data.repeat.40,output.40.permanova)
+plot.precision.permanova.single(data.repeat.50,output.50.permanova)
+output.10.permanova$distance<-10
+output.20.permanova$distance<-20
+output.30.permanova$distance<-30
+output.40.permanova$distance<-40
+output.50.permanova$distance<-50
+output.10.permanova$TransectLength<-"10 meter"
+output.20.permanova$TransectLength<-"20 meter"
+output.30.permanova$TransectLength<-"30 meter"
+output.40.permanova$TransectLength<-"40 meter"
+output.50.permanova$TransectLength<-"50 meter"
+output.permanova.combo<-rbind(output.10.permanova,
+                              output.20.permanova,
+                              output.30.permanova,
+                              output.40.permanova,
+                              output.50.permanova)
+output.permanova.combo$total_distance<-output.permanova.combo$n*output.permanova.combo$distance
+n.i = table(data.repeat.10$Code_Transect)
+nmax = max(n.i)
+output.permanova.combo.temp<-output.permanova.combo[which(output.permanova.combo$n!=1),]
+xmax=20
+ymax=0.3
+g<-ggplot(data = output.permanova.combo.temp,aes(x=n,y=mean,group=TransectLength))
+g<-g+geom_line(aes(colour=TransectLength),size=1)+geom_point()
+g<-g+xlab("Number of repeats")+ylab("MultSE PERMANOVA")+xlim(0,20)+ylim(0,0.30)
+g<-g+geom_ribbon(data=output.permanova.combo.temp,aes(x=n,ymin=lower.025,ymax=upper.975,fill=TransectLength,colour=TransectLength),alpha=0.2)+
+    theme(
+                           #legend.position="centre",
+                           legend.title=element_text(size=10), legend.text=element_text(size=10),
+                           legend.justification=c(0.25,0.25),legend.key.size =  unit(0.1, "in"),
+                           legend.position=c(0.80, 0.7),
+                           #panel.grid.major = element_blank(),
+                           axis.line = element_line(colour = "black"),
+                           text=element_text(size=8,  family="serif"),
+                           panel.background = element_rect(fill = "white", colour = NA),
+                           panel.grid.major = element_line(colour = "gray"),
+                           panel.grid.minor = element_blank(),
+                           axis.title = element_text(size = rel(1), colour = "black"),
+                           axis.text = element_text(size = rel(1), colour = "black"),
+                           line = element_line(colour = "black", size = 0.25, linetype = 1, lineend = "butt"))+
+            annotate("text", x=xmax/10, y=ymax-ymax/10, label= "(A)" ,size=4,family="serif")
+
+c<-ggplot(data=output.permanova.combo.temp,aes(x=total_distance,y=mean))+geom_point(aes(color=TransectLength))+geom_line(aes(color=TransectLength))
+xmax=1000
+ymax=0.3
+c<-c+xlim(0,xmax)+ylim(0,ymax)+xlab("Total distance (m)")+ylab("MultSE PERMANOVA")
+c<-c+theme(legend.title=element_text(size=10), legend.text=element_text(size=10),
+                             legend.justification=c(0.25,0.25),legend.key.size =  unit(0.1, "in"),
+                             legend.position=c(0.80, 0.7),
+                             #panel.grid.major = element_blank(),
+                             axis.line = element_line(colour = "black"),
+                             text=element_text(size=8,  family="serif"),
+                             panel.background = element_rect(fill = "white", colour = NA),
+                             panel.grid.major = element_line(colour = "gray"),
+                             panel.grid.minor = element_blank(),
+                             axis.title = element_text(size = rel(1), colour = "black"),
+                             axis.text = element_text(size = rel(1), colour = "black"),
+                             line = element_line(colour = "black", size = 0.25, linetype = 1, lineend = "butt"))+
+            annotate("text", x=xmax/10, y=ymax-ymax/10, label= "(B)" ,size=4,family="serif")
+c<-c+geom_errorbar(data=output.permanova.combo.temp,aes(x=total_distance,ymin=lower.025,ymax=upper.975,fill=TransectLength,colour=TransectLength),alpha=0.6)
+c
+g
+```
+
+```{r}
+#Plot multSE against total swim distance
+output.permanova.combo.temp$total_distance<-output.permanova.combo.temp$n*output.permanova.combo.temp$distance
+output.permanova.combo.temp$ratio1=(1/output.permanova.combo.temp$mean)/output.permanova.combo.temp$total_distance
+output.permanova.combo.temp$ratio2=(output.permanova.combo.temp$mean)/output.permanova.combo.temp$total_distance
+g<-ggplot(data=output.permanova.combo.temp,aes(x=n,y=ratio1))+geom_point(aes(color=TransectLength))
+g
+h<-ggplot(data=output.permanova.combo.temp,aes(x=n,y=ratio2))+geom_point(aes(color=TransectLength))
+h
+c<-ggplot(data=output.permanova.combo.temp,aes(x=total_distance,y=mean))+geom_point(aes(color=TransectLength))+geom_line(aes(color=TransectLength))
+c
+precision.combo$fRepeat<-as.factor(precision.combo$Repeat)
+d<-ggplot(data=output.permanova.combo.temp,aes(x=total_distance,y=mean))+geom_point(aes(color=n))
+d
+```
+
+
+```{r}
+#Simple histogram of frequency distribution dissimilarity values per transect length
+myhist2 = function(d,breaks) {
+  n.nan = sum(is.nan(d))
+  my.breaks = (0:breaks)/breaks
+  v=hist(d, breaks = my.breaks,xlim=c(-0.1,1),las=1,
+        main = "", xlab = "", ylab = "",ylim=c(0,40000))
+  print(v)
+  points(-0.075,n.nan,pch = 19,cex = 1)
+  text(-0.075,0.0,"NaN",pos = 3)
+  return(v$counts)
+}
+fish.mat.10<-Transformation_data(data.repeat.10,"4root")
+fish.dist.10<-vegdist(fish.mat.10,method="bray")
+myhist2(fish.dist.10,10)
+fish.mat.20<-Transformation_data(data.repeat.20,"4root")
+fish.dist.20<-vegdist(fish.mat.20,method="bray")
+myhist2(fish.dist.20,10)
+fish.mat.30<-Transformation_data(data.repeat.30,"4root")
+fish.dist.30<-vegdist(fish.mat.30,method="bray")
+myhist2(fish.dist.30,10)
+fish.mat.40<-Transformation_data(data.repeat.40,"4root")
+fish.dist.40<-vegdist(fish.mat.40,method="bray")
+myhist2(fish.dist.40,10)
+fish.mat.50<-Transformation_data(data.repeat.50,"4root")
+fish.dist.50<-vegdist(fish.mat.50,method="bray")
+myhist2(fish.dist.50,10)
+```
+
+```{r}
+#Assessment between and within variability
+#Within 1 Transect: Between (Persons)
+list=unique(data.repeat.50$Code_Transect)
+for (i in 1:length(list)){
+  test<-data.repeat.50[which(data.repeat.50$Code_Transect==list[i]),]
+  mean.ID <-as.data.frame(mean(test$totalamountofspecies)-tapply(test$totalamountofspecies, test$Person, mean))
+  colnames(mean.ID)="var"
+  mean.ID$type="between"
+  within.ID <- as.data.frame(test$totalamountofspecies - rep(tapply(test$totalamountofspecies, test$Person, mean), rep(6,3)))
+  colnames(within.ID)="var"
+  within.ID$type="within"
+  if (i==1){
+    x=rbind(mean.ID,within.ID)
+    x$Code_Transect<-list[i]
+  }
+  else {
+    y=rbind(mean.ID,within.ID)
+    y$Code_Transect<-list[i]
+    x=rbind(x,y)
+  }
+}
+g<-ggplot(data = x, aes(x=Code_Transect, y=var)) + geom_boxplot(aes(fill=type))
+g
+```
+
+```{r}
+#Assessment between and within variability
+#Within 1 Person en 1 Location: Between (Transects)
+data.repeat.50$Person_loc=paste(data.repeat.50$Person,data.repeat.50$Location,sep="_")
+list=unique(data.repeat.50$Person_loc)
+for (i in 1:length(list)){
+  test<-data.repeat.50[which(data.repeat.50$Person_loc==list[i]),]
+  mean.ID <-as.data.frame(mean(test$totalamountofspecies)-tapply(test$totalamountofspecies, test$Code_Transect, mean))
+  colnames(mean.ID)="var"
+  mean.ID$type="between"
+  within.ID <- as.data.frame(test$totalamountofspecies - rep(tapply(test$totalamountofspecies, test$Code_Transect, mean), rep(6,3)))
+  colnames(within.ID)="var"
+  within.ID$type="within"
+  if (i==1){
+    x=rbind(mean.ID,within.ID)
+    x$Person_loc<-list[i]
+  }
+  else {
+    y=rbind(mean.ID,within.ID)
+    y$Person_loc<-list[i]
+    x=rbind(x,y)
+  }
+}
+g<-ggplot(data = x, aes(x=Person_loc, y=var)) + geom_boxplot(aes(fill=type))
+g
+```
+
+```{r}
+#Assessment between and within variability
+#Within 1 Location: Between Transects
+list=unique(data.repeat.50$Location)
+for (i in 1:length(list)){
+  test<-data.repeat.50[which(data.repeat.50$Location==list[i]),]
+  mean.ID <-as.data.frame(mean(test$totalamountofspecies)-tapply(test$totalamountofspecies, test$Code_Transect, mean))
+  colnames(mean.ID)="var"
+  mean.ID$type="between"
+  within.ID <- as.data.frame(test$totalamountofspecies - rep(tapply(test$totalamountofspecies, test$Code_Transect, mean), rep(54,3)))
+  colnames(within.ID)="var"
+  within.ID$type="within"
+  if (i==1){
+    x=rbind(mean.ID,within.ID)
+    x$Location<-list[i]
+  }
+  else {
+    y=rbind(mean.ID,within.ID)
+    y$Location<-list[i]
+    x=rbind(x,y)
+  }
+}
+g<-ggplot(data = x, aes(x=Location, y=var)) + geom_boxplot(aes(fill=type))
+g
+```
+```{r}
+#Assessment between and within variability
+#Within 1 Location: Between Persons
+list=unique(data.repeat.50$Location)
+for (i in 1:length(list)){
+  test<-data.repeat.50[which(data.repeat.50$Location==list[i]),]
+  mean.ID <-as.data.frame(mean(test$totalamountofspecies)-tapply(test$totalamountofspecies, test$Person, mean))
+  colnames(mean.ID)="var"
+  mean.ID$type="between"
+  within.ID <- as.data.frame(test$totalamountofspecies - rep(tapply(test$totalamountofspecies, test$Person, mean), rep(54,3)))
+  colnames(within.ID)="var"
+  within.ID$type="within"
+  if (i==1){
+    x=rbind(mean.ID,within.ID)
+    x$Location<-list[i]
+  }
+  else {
+    y=rbind(mean.ID,within.ID)
+    y$Location<-list[i]
+    x=rbind(x,y)
+  }
+}
+g<-ggplot(data = x, aes(x=Location, y=var)) + geom_boxplot(aes(fill=type))
+g
+```
+
+```{r}
+#Assessment between and within variability
+#Within 1 Island: Between Locations
+list=unique(data.repeat.50$Island)
+for (i in 1:length(list)){
+  test<-data.repeat.50[which(data.repeat.50$Island==list[i]),]
+  mean.ID <-as.data.frame(tapply(test$totalamountofspecies, test$Location, mean)-mean(test$totalamountofspecies))
+  colnames(mean.ID)="var"
+  mean.ID$type="between"
+  within.ID <- as.data.frame(rep(tapply(test$totalamountofspecies, test$Location, mean), rep(270,5))-test$totalamountofspecies)
+  colnames(within.ID)="var"
+  within.ID$type="within"
+  if (i==1){
+    x=rbind(mean.ID,within.ID)
+    x$Island<-list[i]
+  }
+  else {
+    y=rbind(mean.ID,within.ID)
+    y$Island<-list[i]
+    x=rbind(x,y)
+  }
+}
+g<-ggplot(data = x, aes(x=Island, y=var)) + geom_boxplot(aes(fill=type))
+g
+```
+
+```{r}
+#Assessment effect counting metric, resemblance matrix, transformation, transect length on level of unexplained variability
+data.repeat.list.N=list(data.repeat.10,data.repeat.20,data.repeat.30,data.repeat.40,data.repeat.50)
+data.repeat.list.maxN=list(data.repeat.10,data.repeat.20,data.repeat.30,data.repeat.40,data.repeat.50)
+transform=c("presence-absence","4root","log")
+method=c("bray","euclidean","kulczynski","gower")
+TransectLength=c(10,20,30,40,50)
+metric=c("N","maxN")
+a<-expand.grid(TransectLength=TransectLength,metric=metric,transform=transform,method=method,stringsAsFactors = FALSE)
+for (i in 1:nrow(a)){
+  if (a$metric[i]=="maxN"){
+    if (a$TransectLength[i]==10){
+      data=data.repeat.10
+    }
+    if (a$TransectLength[i]==20){
+      data=data.repeat.20
+    }
+    if (a$TransectLength[i]==30){
+      data=data.repeat.30
+    }
+    if (a$TransectLength[i]==40){
+      data=data.repeat.40
+    }
+    if (a$TransectLength[i]==50){
+      data=data.repeat.50
+    }
+  }
+  if (a$metric[i]=="N"){
+    if (a$TransectLength[i]==10){
+      data=data.repeat.10
+    }
+    if (a$TransectLength[i]==20){
+      data=data.repeat.20
+    }
+    if (a$TransectLength[i]==30){
+      data=data.repeat.30
+    }
+    if (a$TransectLength[i]==40){
+      data=data.repeat.40
+    }
+    if (a$TransectLength[i]==50){
+      data=data.repeat.50
+    }
+  }
+  tryCatch({
+  p<-Personal_PERMANOVA(data.repeat=data,
+                     factors=c('Island','Location','Code_Transect','Person'),
+                     response='fish.dist',
+                     algo='*',
+                     type="adonis",
+                     transform=a$transform[i],
+                     method=a$method[i]
+                     )
+  if (i==1){
+    rownames=rownames(p$aov.tab)
+    a[,rownames]<-NA
+  }
+  q<-p$aov.tab
+  a[i,rownames]=q$R2
+  },error=function(e){cat("ERROR :",conditionMessage(e), "\n")})
+}
+squaredR_for_different_combos<-a
+```
+
+```{r}
+#Plot assessment effect counting metric, resemblance matrix, transformation, transect length on level of unexplained variability
+general_theme<-theme(
+                           axis.line = element_line(colour = "black"),
+                           text=element_text(size=16,  family="serif"),
+                           panel.background = element_rect(fill = "white", colour = NA),
+                           panel.grid.major = element_line(colour = "gray"),
+                           panel.grid.minor = element_blank(),
+                           axis.title = element_text(size = rel(0.75), colour = "black"),
+                           axis.text = element_text(size = rel(0.75), colour = "black"),
+                           line = element_line(colour = "black", size = 0.5, linetype = 1, lineend = "butt")
+                           )
+
+
+a$fTransectLength<-as.factor(a$TransectLength)
+a$metric[which(a$metric=="maxN")]="MinCount"
+a$metric[which(a$metric=="N")]="MaxCount"
+h<-ggplot(data=a,aes(x=fTransectLength,y=Residuals))+stat_boxplot(geom ='errorbar')+geom_boxplot()
+h<-h+general_theme+ylab("R² Residuals")+xlab("Transect length (m)")
+
+h
+i<-ggplot(data=a,aes(x=metric,y=Residuals))+stat_boxplot(geom ='errorbar')+geom_boxplot()
+i<-i+general_theme+ylab("R² Residuals")+xlab("Metric")
+i
+j<-ggplot(data=a,aes(x=transform,y=Residuals))+stat_boxplot(geom ='errorbar')+geom_boxplot()
+j<-j+general_theme+ylab("R² Residuals")+xlab("Transformation")
+j
+k<-ggplot(data=a,aes(x=method,y=Residuals))+stat_boxplot(geom ='errorbar')+geom_boxplot()
+k<-k+general_theme+xlab("Dissimilarity matrix")+ylab("R² Residuals")
+k
+```
+
+```{r}
+a$fTransectLength<-as.factor(a$TransectLength)
+j<-ggplot(data=a,aes(x=metric,y=Residuals,color=fTransectLength))+stat_boxplot(geom ='errorbar')+geom_boxplot()
+j<-j+general_theme+ylab("R? Residuals")+xlab("Transformation")
+j
+```
+
+
+```{r}
+#Assessment effect counting metric, resemblance matrix, transformation, transect length on level of explained variability
+a$Total<-NULL
+a <- a %>% 
+  dplyr::rename(
+    Observer = Person,
+    Transect = Code_Transect,
+    `Island:Observer`=`Island:Person`,
+    `Location:Observer`=`Location:Person`,
+    `Transect:Observer`=`Code_Transect:Person`
+    )
+b<-melt(a, id=c("TransectLength","metric","transform","method","fTransectLength"))
+h<-ggplot(data=b,aes(x=fTransectLength,y=value,color=variable))+stat_boxplot(geom ='errorbar')+geom_boxplot()
+h<-h+general_theme+ylab("R²")+xlab("Transect length (m)")
+h
+i<-ggplot(data=b,aes(x=metric,y=value,color=variable))+stat_boxplot(geom ='errorbar')+geom_boxplot()
+i<-i+general_theme+ylab("R²")+xlab("Metric")
+i
+j<-ggplot(data=b,aes(x=transform,y=value,color=variable))+stat_boxplot(geom ='errorbar')+geom_boxplot()
+j<-j+general_theme+ylab("R²")+xlab("Transformation")
+j
+k<-ggplot(data=b,aes(x=method,y=value,color=variable))+stat_boxplot(geom ='errorbar')+geom_boxplot()
+k<-k+general_theme+ylab("R²")+xlab("Dissimilarity matrix")
+k
+
+```
