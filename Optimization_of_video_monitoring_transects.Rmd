@@ -71,7 +71,7 @@ if (file.exists("./Rdata/")==FALSE){dir.create("./Rdata/")}
 
 ```{r echo=FALSE}
 #Read and process the list with observed species. This file will be used later to select the 'species' columns from the data 
-specieslist=read_excel("./specieslist_fake.xlsx")
+specieslist=read_excel("./specieslist.xlsx")
 specieslist=as.data.frame(specieslist[,2])
 colnames(specieslist)="Species"
 specieslist<-t(specieslist)
@@ -180,11 +180,11 @@ RUN<-function(file_name,baseline){
 
 ```{r}
 #Preprocess the data, add all species and insert empty rows if needed
-data.repeat.50<-RUN.baseline("./Data/Fake_data/N50.xlsx")
-data.repeat.40<-RUN("./Data/Fake_data/N40.xlsx",data.repeat.50)
-data.repeat.30<-RUN("./Data/Fake_data/N30.xlsx",data.repeat.50)
-data.repeat.20<-RUN("./Data/Fake_data/N20.xlsx",data.repeat.50)
-data.repeat.10<-RUN("./Data/Fake_data/N10.xlsx",data.repeat.50)
+data.repeat.50<-RUN.baseline("./Data/Real_data/N50.xlsx")
+data.repeat.40<-RUN("./Data/Real_data/N40.xlsx",data.repeat.50)
+data.repeat.30<-RUN("./Data/Real_data/N30.xlsx",data.repeat.50)
+data.repeat.20<-RUN("./Data/Real_data/N20.xlsx",data.repeat.50)
+data.repeat.10<-RUN("./Data/Real_data/N10.xlsx",data.repeat.50)
 ```
 
 ```{r}
